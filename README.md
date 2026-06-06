@@ -287,6 +287,14 @@ pip3 install vllm==0.8.2
 ```
 The warnings can be safely ignored.
 
+Extra implementation error resolution:
+bash```
+# numpy issue
+pip uninstall -y numpy scipy scikit-learn
+rm -rf $CONDA_PREFIX/lib/python3.10/site-packages/numpy \
+       $CONDA_PREFIX/lib/python3.10/site-packages/numpy-2.2.6.dist-info
+pip install --no-cache-dir numpy==1.26.4 scipy==1.13.1 scikit-learn==1.5.2
+```
 ---
 
 ### 3. Search

@@ -109,10 +109,12 @@ class WebshopMultiProcessEnv(gym.Env):
         self.group_n = group_n
         self.env_num = env_num
         self.num_processes = env_num * group_n
+        self.active_processes = self.num_processes
         self.is_train = is_train
         if not is_train: assert group_n == 1
 
         self._rng = np.random.RandomState(seed)
+        self._eval_cursor = 0
 
         self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
 
@@ -149,15 +151,22 @@ class WebshopMultiProcessEnv(gym.Env):
     # Base API ----------------------------------------------------------
     # ------------------------------------------------------------------
 
+    def set_active_env_num(self, active_env_num: int):
+        if active_env_num < 1 or active_env_num > self.env_num:
+            raise ValueError(f"active_env_num must be in [1, {self.env_num}], got {active_env_num}")
+        if active_env_num * self.group_n > self.num_processes:
+            raise ValueError(f"active_env_num={active_env_num} exceeds available workers")
+        self.active_processes = active_env_num * self.group_n
+
     def step(self, actions: list[str]):
-        if len(actions) != self.num_processes:
+        if len(actions) != self.active_processes:
             raise ValueError(
-                f'Expected {self.num_processes} actions, got {len(actions)}',
+                f'Expected {self.active_processes} actions, got {len(actions)}',
             )
 
         # Send step commands to all workers
         futures = []
-        for worker, action in zip(self._workers, actions):
+        for worker, action in zip(self._workers[:self.active_processes], actions):
             future = worker.step.remote(action)
             futures.append(future)
 
@@ -173,12 +182,23 @@ class WebshopMultiProcessEnv(gym.Env):
         return obs_list, reward_list, done_list, info_list
 
     def reset(self):
-        idx = self._rng.choice(self.goal_idxs, size=self.env_num, replace=False)
+        active_env_num = self.active_processes // self.group_n
+        if self.is_train:
+            idx = self._rng.choice(self.goal_idxs, size=active_env_num, replace=False)
+        else:
+            goal_idxs = list(self.goal_idxs)
+            start = self._eval_cursor
+            stop = start + active_env_num
+            if stop <= len(goal_idxs):
+                idx = goal_idxs[start:stop]
+            else:
+                idx = goal_idxs[start:] + goal_idxs[: stop - len(goal_idxs)]
+            self._eval_cursor = stop % len(goal_idxs)
         idx = np.repeat(idx, self.group_n).tolist()
 
         # Send reset commands to all workers
         futures = []
-        for worker, i in zip(self._workers, idx):
+        for worker, i in zip(self._workers[:self.active_processes], idx):
             future = worker.reset.remote(i)
             futures.append(future)
 

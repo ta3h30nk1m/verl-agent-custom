@@ -386,6 +386,10 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
+
+    def set_active_env_num(self, active_env_num: int):
+        if hasattr(self.envs, "set_active_env_num"):
+            self.envs.set_active_env_num(active_env_num)
     
     def reset(self, kwargs) -> Dict[str, Any]:
         obs, infos = self.envs.reset()

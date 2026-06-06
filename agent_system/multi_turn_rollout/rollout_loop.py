@@ -502,6 +502,8 @@ class TrajectoryCollector:
         """
         if is_train:
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
+        elif hasattr(envs, "set_active_env_num"):
+            envs.set_active_env_num(len(gen_batch.batch))
             
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:

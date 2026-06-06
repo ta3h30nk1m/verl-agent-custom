@@ -13,7 +13,7 @@ pyarrow>=19.0.0
 pybind11
 pylatexenc
 pre-commit
-ray[default]
+ray[default,cgraph]==2.43.0
 tensordict<=0.6.2
 torchdata
 transformers==4.51.1
