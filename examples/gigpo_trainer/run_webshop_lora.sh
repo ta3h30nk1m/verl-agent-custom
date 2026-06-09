@@ -6,6 +6,8 @@ num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment wo
 
 train_data_size=16
 val_data_size=128
+val_goal_start=${WEBSHOP_VAL_GOAL_START:-0}
+val_goal_end=${WEBSHOP_VAL_GOAL_END:-500}
 group_size=8
 mode="mean_norm" # "mean_norm" or "mean_std_norm"
 
@@ -58,6 +60,8 @@ python3 -m verl.trainer.main_ppo \
     env.env_name=Webshop \
     env.seed=0 \
     env.max_steps=15 \
+    env.webshop.val_goal_start=$val_goal_start \
+    env.webshop.val_goal_end=$val_goal_end \
     env.rollout.n=$group_size \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \

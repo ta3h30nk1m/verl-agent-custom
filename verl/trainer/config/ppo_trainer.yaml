@@ -37,6 +37,7 @@ actor_rollout_ref:
     lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
     lora_alpha: 16  # LoRA scaling factor
     target_modules: all-linear  # all-linear or [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
+    lora_target_scope: all  # all, llm, or llm_attention. llm* excludes vision/audio encoders, projectors, embeddings, and heads.
     use_liger: False
     use_fused_kernels: False
     trust_remote_code: False
@@ -182,6 +183,7 @@ critic:
     lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
     lora_alpha: 16  # LoRA scaling factor
     target_modules: all-linear  # all-linear or [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
+    lora_target_scope: all  # all, llm, or llm_attention. llm* excludes vision/audio encoders, projectors, embeddings, and heads.
   ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
   ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
   ppo_micro_batch_size_per_gpu: null
@@ -314,3 +316,6 @@ env:
   webshop:
     use_small: True
     human_goals: False
+    prompt_style: tagged # tagged, direct, react, act, act_state
+    val_goal_start: 0
+    val_goal_end: 500

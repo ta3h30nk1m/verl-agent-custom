@@ -55,6 +55,7 @@ from verl.utils.fsdp_utils import (
     layered_summon_lora_params,
 )
 from verl.utils.import_utils import import_external_libs
+from verl.utils.lora_utils import resolve_lora_target_modules
 from verl.utils.model import compute_position_id_with_mask
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
@@ -270,12 +271,23 @@ class ActorRolloutRefWorker(Worker):
             if self._is_lora:
                 print("Applying LoRA to actor module")
                 actor_module.enable_input_require_grads()
+                target_modules = resolve_lora_target_modules(
+                    actor_module,
+                    convert_to_regular_types(self.config.model.target_modules),
+                    self.config.model.get("lora_target_scope", "all"),
+                )
+                if self.rank == 0:
+                    print(
+                        "Applying LoRA to actor module: "
+                        f"target_scope={self.config.model.get('lora_target_scope', 'all')}, "
+                        f"num_target_modules={len(target_modules) if isinstance(target_modules, list) else target_modules}"
+                    )
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
                     'task_type': TaskType.CAUSAL_LM,
                     'r': self.config.model.lora_rank,
                     'lora_alpha': self.config.model.lora_alpha,
-                    'target_modules': convert_to_regular_types(self.config.model.target_modules),
+                    'target_modules': target_modules,
                     'bias': "none"
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
@@ -912,12 +924,23 @@ class CriticWorker(Worker):
         if self._is_lora:
             print("Applying LoRA to critic module")
             critic_module.enable_input_require_grads()
+            target_modules = resolve_lora_target_modules(
+                critic_module,
+                convert_to_regular_types(self.config.model.target_modules),
+                self.config.model.get("lora_target_scope", "all"),
+            )
+            if self.rank == 0:
+                print(
+                    "Applying LoRA to critic module: "
+                    f"target_scope={self.config.model.get('lora_target_scope', 'all')}, "
+                    f"num_target_modules={len(target_modules) if isinstance(target_modules, list) else target_modules}"
+                )
             # Convert config to regular Python types before creating PEFT model
             lora_config = {
                 'task_type': TaskType.CAUSAL_LM,
                 'r': self.config.model.lora_rank,
                 'lora_alpha': self.config.model.lora_alpha,
-                'target_modules': convert_to_regular_types(self.config.model.target_modules),
+                'target_modules': target_modules,
                 'bias': "none",
             }
             critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))

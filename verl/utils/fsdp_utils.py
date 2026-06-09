@@ -31,6 +31,7 @@ from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from transformers.trainer_pt_utils import get_module_class_from_name
 from verl.utils.device import get_torch_device, get_device_name
+from verl.utils.lora_utils import find_language_layer_classes
 
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, fully_shard
@@ -85,7 +86,8 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         return None
 
     default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
-    fsdp_transformer_layer_cls_to_wrap = _get_attr("transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap)
+    configured_transformer_cls_to_wrap = _get_attr("transformer_layer_cls_to_wrap", None)
+    fsdp_transformer_layer_cls_to_wrap = configured_transformer_cls_to_wrap or default_transformer_cls_names_to_wrap
     min_num_params = _get_attr("min_num_params", 0)
     auto_wrap_policy = None
 
@@ -107,12 +109,22 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
+        missing_layer_classes = []
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
+                missing_layer_classes.append(layer_class)
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
+        if missing_layer_classes:
+            if configured_transformer_cls_to_wrap:
+                raise Exception(
+                    "Could not find the transformer layer class to wrap in the model: "
+                    f"{missing_layer_classes}"
+                )
+            transformer_cls_to_wrap.update(find_language_layer_classes(module))
+        if not transformer_cls_to_wrap:
+            raise Exception("Could not find the transformer layer class to wrap in the model.")
 
         transformer_policy = functools.partial(
             transformer_auto_wrap_policy,
@@ -427,16 +439,32 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
 
     default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
-    fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get("transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap)
+    configured_transformer_cls_to_wrap = config.get("wrap_policy", {}).get("transformer_layer_cls_to_wrap", None)
+    fsdp_transformer_layer_cls_to_wrap = configured_transformer_cls_to_wrap or default_transformer_cls_names_to_wrap
 
     if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
         fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
 
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 
+    transformer_cls_to_wrap = set()
+    if fsdp_transformer_layer_cls_to_wrap is not None:
+        for layer_class in fsdp_transformer_layer_cls_to_wrap:
+            transformer_cls = get_module_class_from_name(model, layer_class)
+            if transformer_cls is not None:
+                transformer_cls_to_wrap.add(transformer_cls)
+    if not transformer_cls_to_wrap and configured_transformer_cls_to_wrap:
+        raise Exception(
+            "Could not find the transformer layer class to wrap in the model: "
+            f"{fsdp_transformer_layer_cls_to_wrap}"
+        )
+    if not transformer_cls_to_wrap:
+        transformer_cls_to_wrap = find_language_layer_classes(model)
+    assert len(transformer_cls_to_wrap) > 0
+
     modules = []
     for name, module in model.named_modules():
-        if module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap or (isinstance(module, nn.Embedding) and not model.config.tie_word_embeddings):
+        if module.__class__ in transformer_cls_to_wrap or (isinstance(module, nn.Embedding) and not model.config.tie_word_embeddings):
             modules.append(module)
 
     for idx, module in enumerate(modules):

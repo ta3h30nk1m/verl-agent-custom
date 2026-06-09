@@ -14,6 +14,7 @@ data:
     enable: false  # Set to true to use multi-turn dataset
     messages_key: messages  # Key for messages list in multi-turn mode
   max_length: 1024
+  pad_to_max_length: true
   truncation: error
   balance_dp_token: False
   chat_template: null
@@ -35,6 +36,7 @@ model:
   lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
   lora_alpha: 16  # LoRA scaling factor
   target_modules: all-linear  # Target modules for LoRA adaptation
+  lora_target_scope: all  # all, llm, or llm_attention. llm* excludes vision/audio encoders, projectors, embeddings, and heads.
   use_liger: False
   strategy: fsdp2
 optim:
@@ -54,6 +56,32 @@ trainer:
   experiment_name: test
   total_epochs: 4
   total_training_steps: null
+  loss_validation_enable: true
+  val_before_train: false
+  test_freq: -1
+  online_webshop_validation:
+    enable: false
+    freq: -1
+    backend: hf
+    num_episodes: 16
+    goal_start: 500
+    goal_end: 1000
+    prompt_style: act_state
+    history_length: 2
+    max_steps: 15
+    max_prompt_length: 8192
+    max_new_tokens: 1024
+    temperature: 0.4
+    top_p: 1.0
+    do_sample: true
+    torch_dtype: bfloat16
+    device: cuda
+    trust_remote_code: true
+    use_small: true
+    human_goals: false
+    ray_num_cpus: 2
+    num_cpus_per_env_worker: 0.1
+    output_dir: null
+    cuda_visible_devices: null
   logger: ['console']
   seed: 1
-

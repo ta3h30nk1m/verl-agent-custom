@@ -23,8 +23,12 @@ import os
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import json
 import logging
 import re
+import subprocess
+import sys
+from functools import partial
 from contextlib import nullcontext
 
 import hydra
@@ -56,6 +60,7 @@ from verl.utils.fsdp_utils import (
     init_fn,
     fsdp2_clip_grad_norm_
 )
+from verl.utils.lora_utils import resolve_lora_target_modules
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.tracking import Tracking
@@ -82,6 +87,37 @@ def extract_step(path):
     if match:
         return int(match.group(1))
     return None
+
+
+def normalize_floating_module_dtype(module: nn.Module, dtype: torch.dtype):
+    for param in module.parameters():
+        if param.is_meta or not torch.is_floating_point(param):
+            continue
+        param.data = param.data.to(dtype)
+    for buffer in module.buffers():
+        if buffer.is_meta or not torch.is_floating_point(buffer):
+            continue
+        buffer.data = buffer.data.to(dtype)
+
+
+def collate_sft_batch(data_list, pad_token_id):
+    max_length = max(data["input_ids"].shape[-1] for data in data_list)
+    batch = {}
+    for key in data_list[0]:
+        values = []
+        for data in data_list:
+            value = data[key]
+            pad_length = max_length - value.shape[-1]
+            if pad_length > 0:
+                if key == "input_ids":
+                    pad_value = pad_token_id
+                else:
+                    pad_value = 0
+                padding = torch.full((pad_length,), pad_value, dtype=value.dtype)
+                value = torch.cat((value, padding), dim=-1)
+            values.append(value)
+        batch[key] = torch.stack(values, dim=0)
+    return batch
 
 
 class FSDPSFTTrainer:
@@ -145,6 +181,9 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        collate_fn = partial(collate_sft_batch, pad_token_id=pad_token_id)
+
         self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True)
         self.train_dataloader = DataLoader(
             dataset=self.train_dataset,
@@ -153,16 +192,18 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=True,
+            collate_fn=collate_fn,
         )
 
-        self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True)
+        self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=False)
         self.val_dataloader = DataLoader(
             dataset=self.val_dataset,
             batch_size=config.data.micro_batch_size_per_gpu,
             sampler=self.val_sampler,
             num_workers=8,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
+            collate_fn=collate_fn,
         )
 
     def _build_model_optimizer(self):
@@ -211,15 +252,28 @@ class FSDPSFTTrainer:
 
             if self.config.model.get("lora_rank", 0) > 0:
                 self.model.enable_input_require_grads()
+                target_modules = resolve_lora_target_modules(
+                    self.model,
+                    convert_to_regular_types(self.config.model.target_modules),
+                    self.config.model.get("lora_target_scope", "all"),
+                )
+                if self.device_mesh.get_rank() == 0:
+                    print(
+                        "Applying LoRA to SFT model: "
+                        f"target_scope={self.config.model.get('lora_target_scope', 'all')}, "
+                        f"num_target_modules={len(target_modules) if isinstance(target_modules, list) else target_modules}"
+                    )
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
                     "task_type": TaskType.CAUSAL_LM,
                     "r": self.config.model.lora_rank,
                     "lora_alpha": self.config.model.lora_alpha,
-                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    "target_modules": target_modules,
                     "bias": "none",
                 }
                 self.model = get_peft_model(self.model, LoraConfig(**lora_config))
+
+            normalize_floating_module_dtype(self.model, torch.float32)
 
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -276,8 +330,14 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
+        self.trainable_parameters = [param for param in self.fsdp_model.parameters() if param.requires_grad]
+        if self.device_mesh.get_rank() == 0:
+            trainable_numel = sum(param.numel() for param in self.trainable_parameters)
+            total_numel = sum(param.numel() for param in self.fsdp_model.parameters())
+            print(f"Trainable parameters: {trainable_numel:,} / {total_numel:,}")
+
         self.optimizer = optim.AdamW(
-            self.fsdp_model.parameters(),
+            self.trainable_parameters,
             lr=self.config.optim.lr,
             betas=self.config.optim.betas,
             weight_decay=self.config.optim.weight_decay,
@@ -323,7 +383,7 @@ class FSDPSFTTrainer:
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels.contiguous()
                 # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
                 shift_labels = shift_labels.view(-1)
                 # Enable model parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
@@ -406,7 +466,7 @@ class FSDPSFTTrainer:
         if self.config.model.strategy == 'fsdp':
             grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == 'fsdp2':
-            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
+            grad_norm = fsdp2_clip_grad_norm_(self.trainable_parameters, max_norm=self.config.optim.clip_grad)
         else:
             raise NotImplementedError(f"not implement {self.config.model.strategy}")
 
@@ -446,6 +506,115 @@ class FSDPSFTTrainer:
                 torch.distributed.all_reduce(loss)
                 loss /= self.ulysses_device_mesh.size(0)
         return loss
+
+    def _to_tensordict(self, data):
+        batch_size = data["input_ids"].shape[0]
+        return TensorDict(data, batch_size=batch_size).to(self.device_name)
+
+    def _validate_and_log(self, tracking, step):
+        rank = self.device_mesh.get_rank()
+        val_losses = []
+        for data in self.val_dataloader:
+            val_data = self._to_tensordict(data)
+            val_loss = self.validation_step(val_data)
+            val_losses.append(val_loss)
+
+        if rank == 0:
+            if val_losses:
+                val_loss = torch.mean(torch.stack(val_losses))
+                metric = {"val/loss": val_loss.detach().item()}
+                tracking.log(data=metric, step=step)
+            else:
+                print("Skip validation because the validation dataloader is empty.")
+        torch.distributed.barrier()
+
+    def _run_online_webshop_validation(self, tracking, step, checkpoint_path):
+        online_config = self.config.trainer.get("online_webshop_validation", {})
+        if not online_config or not online_config.get("enable", False):
+            return
+
+        rank = self.device_mesh.get_rank()
+        if rank == 0:
+            output_dir = online_config.get("output_dir", None)
+            if output_dir is None:
+                output_dir = os.path.join(
+                    self.config.trainer.default_local_dir,
+                    "webshop_online_validation",
+                    f"global_step_{step}",
+                )
+            else:
+                output_dir = os.path.join(str(output_dir), f"global_step_{step}")
+
+            command = [
+                sys.executable,
+                "-m",
+                "examples.validation.webshop_llm_eval",
+                "--backend",
+                str(online_config.get("backend", "hf")),
+                "--model-path",
+                str(self.config.model.partial_pretrain),
+                "--output-dir",
+                str(output_dir),
+                "--num-episodes",
+                str(online_config.get("num_episodes", 16)),
+                "--goal-start",
+                str(online_config.get("goal_start", 500)),
+                "--goal-end",
+                str(online_config.get("goal_end", 1000)),
+                "--max-steps",
+                str(online_config.get("max_steps", 15)),
+                "--history-length",
+                str(online_config.get("history_length", 2)),
+                "--prompt-style",
+                str(online_config.get("prompt_style", "act_state")),
+                "--max-prompt-length",
+                str(online_config.get("max_prompt_length", 8192)),
+                "--max-new-tokens",
+                str(online_config.get("max_new_tokens", 1024)),
+                "--temperature",
+                str(online_config.get("temperature", 0.4)),
+                "--top-p",
+                str(online_config.get("top_p", 1.0)),
+                "--do-sample",
+                str(online_config.get("do_sample", True)).lower(),
+                "--torch-dtype",
+                str(online_config.get("torch_dtype", "bfloat16")),
+                "--device",
+                str(online_config.get("device", "cuda")),
+                "--trust-remote-code",
+                str(online_config.get("trust_remote_code", True)).lower(),
+                "--use-small",
+                str(online_config.get("use_small", True)).lower(),
+                "--human-goals",
+                str(online_config.get("human_goals", False)).lower(),
+                "--ray-num-cpus",
+                str(online_config.get("ray_num_cpus", 2)),
+                "--num-cpus-per-env-worker",
+                str(online_config.get("num_cpus_per_env_worker", 0.1)),
+            ]
+            if self.config.model.get("lora_rank", 0) > 0:
+                command.extend(["--lora-adapter", checkpoint_path])
+
+            env = os.environ.copy()
+            cuda_visible_devices = online_config.get("cuda_visible_devices", None)
+            if cuda_visible_devices is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
+
+            print(f"Running online WebShop validation: {' '.join(command)}")
+            subprocess.run(command, check=True, env=env)
+
+            summary_path = os.path.join(output_dir, "summary.json")
+            if os.path.exists(summary_path):
+                with open(summary_path) as f:
+                    summary = json.load(f)
+                metrics = {
+                    "val/webshop_score": summary.get("mean_score", 0.0),
+                    "val/webshop_success_rate": summary.get("success_rate", 0.0),
+                    "val/webshop_episode_length": summary.get("mean_episode_length", 0.0),
+                }
+                tracking.log(data=metrics, step=step)
+
+        torch.distributed.barrier()
 
     def save_checkpoint(self, step):
         # save checkpoint
@@ -488,6 +657,7 @@ class FSDPSFTTrainer:
             hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
 
         torch.distributed.barrier()
+        return path
 
     def fit(self):
         rank = self.device_mesh.get_rank()
@@ -513,7 +683,11 @@ class FSDPSFTTrainer:
 
         # TODO (zhangchi.usc1992) add back checkpoint manager.
         # Currently, it blocks when uploading to hdfs. So very slow.
+        loss_validation_enable = self.config.trainer.get("loss_validation_enable", True)
+        if loss_validation_enable and self.config.trainer.get("val_before_train", False):
+            self._validate_and_log(tracking=tracking if rank == 0 else None, step=global_step)
 
+        last_online_validation_step = -1
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
             for data in tqdm(
@@ -523,43 +697,54 @@ class FSDPSFTTrainer:
                 disable=rank != 0
             ):
                 global_step += 1
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                data = self._to_tensordict(data)
                 metric = self.training_step(data)
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 
-                # for early exit validation
-                if global_step >= self.total_training_steps:
-                    # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(self.device_name)
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-                    torch.distributed.barrier()
+                is_last_step = global_step >= self.total_training_steps
+                test_freq = self.config.trainer.get("test_freq", -1)
+                if loss_validation_enable and test_freq > 0 and (is_last_step or global_step % test_freq == 0):
+                    self._validate_and_log(tracking=tracking if rank == 0 else None, step=global_step)
 
+                did_online_validation = False
+                online_freq = self.config.trainer.get("online_webshop_validation", {}).get("freq", -1)
+                if online_freq > 0 and global_step % online_freq == 0:
+                    checkpoint_path = self.save_checkpoint(step=global_step)
+                    self._run_online_webshop_validation(
+                        tracking=tracking if rank == 0 else None,
+                        step=global_step,
+                        checkpoint_path=checkpoint_path,
+                    )
+                    last_online_validation_step = global_step
+                    did_online_validation = True
+
+                # for early exit validation
+                if is_last_step:
                     # Save final checkpoint
-                    self.save_checkpoint(step=global_step)
+                    if not did_online_validation:
+                        checkpoint_path = self.save_checkpoint(step=global_step)
+                        self._run_online_webshop_validation(
+                            tracking=tracking if rank == 0 else None,
+                            step=global_step,
+                            checkpoint_path=checkpoint_path,
+                        )
                     return
 
             # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).to(self.device_name)
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {"val/loss": val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
-            torch.distributed.barrier()
+            if loss_validation_enable and self.config.trainer.get("test_freq", -1) <= 0:
+                self._validate_and_log(tracking=tracking if rank == 0 else None, step=global_step)
 
             # save checkpoint
-            self.save_checkpoint(step=global_step)
+            checkpoint_path = self.save_checkpoint(step=global_step)
+            online_freq = self.config.trainer.get("online_webshop_validation", {}).get("freq", -1)
+            if online_freq > 0 and global_step % online_freq == 0 and last_online_validation_step != global_step:
+                self._run_online_webshop_validation(
+                    tracking=tracking if rank == 0 else None,
+                    step=global_step,
+                    checkpoint_path=checkpoint_path,
+                )
+                last_online_validation_step = global_step
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)

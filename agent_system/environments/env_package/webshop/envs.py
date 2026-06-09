@@ -39,6 +39,14 @@ class WebshopWorker:
     
     def step(self, action):
         """Execute a step in the environment"""
+        if isinstance(action, str) and action.lower().startswith('think['):
+            info = {
+                'available_actions': self.env.get_available_actions(),
+                'task_score': 0.0,
+                'won': False,
+            }
+            return 'OK.', 0.0, False, info
+
         obs, reward, done, info = self.env.step(action)
         info = dict(info or {})  # make a *copy* so we can mutate safely
         info['available_actions'] = self.env.get_available_actions()
@@ -141,7 +149,16 @@ class WebshopMultiProcessEnv(gym.Env):
         #     self.goal_idxs = range(len(self.env.server.goals))
 
         if not self.is_train:
-            self.goal_idxs = range(500)
+            val_goal_start = self._env_kwargs.get("val_goal_start", 0)
+            val_goal_end = self._env_kwargs.get("val_goal_end", 500)
+            if val_goal_end is None:
+                val_goal_end = len(goals)
+            if val_goal_start < 0 or val_goal_end <= val_goal_start or val_goal_end > len(goals):
+                raise ValueError(
+                    f"Invalid WebShop validation goal range [{val_goal_start}, {val_goal_end}) "
+                    f"for {len(goals)} goals."
+                )
+            self.goal_idxs = range(val_goal_start, val_goal_end)
         else:
             self.goal_idxs = range(500, len(goals))
             

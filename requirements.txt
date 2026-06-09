@@ -14,6 +14,7 @@ pybind11
 pylatexenc
 pre-commit
 ray[default,cgraph]==2.43.0
+timm
 tensordict<=0.6.2
 torchdata
 transformers==4.51.1

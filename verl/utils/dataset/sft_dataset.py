@@ -44,6 +44,7 @@ class SFTDataset(Dataset):
         response_key = config.get("response_key", "response")
         response_dict_keys = config.get("response_dict_keys", None)
         max_length = config.get("max_length", 1024)
+        pad_to_max_length = config.get("pad_to_max_length", True)
         truncation = config.get("truncation", "error")
         use_shm = config.get('use_shm', False)
 
@@ -65,6 +66,7 @@ class SFTDataset(Dataset):
         self.response_dict_keys = response_dict_keys if response_dict_keys else []
 
         self.max_length = max_length
+        self.pad_to_max_length = pad_to_max_length
 
         self._download()
         self._read_files_and_tokenize()
@@ -145,7 +147,7 @@ class SFTDataset(Dataset):
 
         # padding to max length
         sequence_length = input_ids.shape[0]
-        if sequence_length < self.max_length:
+        if self.pad_to_max_length and sequence_length < self.max_length:
             padded_input_ids = torch.ones(size=(self.max_length - sequence_length,), dtype=input_ids.dtype) * self.tokenizer.pad_token_id
             padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
 

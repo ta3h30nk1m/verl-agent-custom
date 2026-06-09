@@ -662,6 +662,76 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _to_jsonable(self, value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
+            return value.item() if value.numel() == 1 else value.tolist()
+        if isinstance(value, np.ndarray):
+            return [self._to_jsonable(item) for item in value.tolist()]
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {k: self._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._to_jsonable(item) for item in value]
+        return value
+
+    def _build_validation_dump_entries(self, batch, scores):
+        """Build one JSONL entry per validation trajectory."""
+        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+        non_tensor = batch.non_tensor_batch
+        data_sources = non_tensor.get("data_source", ["unknown"] * len(inputs))
+        traj_uids = non_tensor.get("traj_uid", np.arange(len(inputs), dtype=object))
+        episode_rewards = non_tensor.get("episode_rewards", [None] * len(inputs))
+        episode_lengths = non_tensor.get("episode_lengths", [None] * len(inputs))
+        tool_callings = non_tensor.get("tool_callings", [None] * len(inputs))
+        success_keys = [key for key in non_tensor.keys() if "success_rate" in key]
+
+        entries_by_uid = {}
+        for i, (input_text, output_text, score) in enumerate(zip(inputs, outputs, scores)):
+            traj_uid = str(self._to_jsonable(traj_uids[i]))
+            if traj_uid not in entries_by_uid:
+                entry = {
+                    "step": self.global_steps,
+                    "traj_uid": traj_uid,
+                    "data_source": self._to_jsonable(data_sources[i]),
+                    "score": self._to_jsonable(score),
+                    "episode_reward": self._to_jsonable(episode_rewards[i]),
+                    "episode_length": self._to_jsonable(episode_lengths[i]),
+                    "tool_callings": self._to_jsonable(tool_callings[i]),
+                    "steps": [],
+                }
+                for key in success_keys:
+                    entry[key] = self._to_jsonable(non_tensor[key][i])
+                entries_by_uid[traj_uid] = entry
+
+            entries_by_uid[traj_uid]["steps"].append(
+                {
+                    "turn_index": len(entries_by_uid[traj_uid]["steps"]),
+                    "input": input_text,
+                    "output": output_text,
+                    "score": self._to_jsonable(score),
+                }
+            )
+
+        entries = list(entries_by_uid.values())
+        for entry in entries:
+            entry["input"] = entry["steps"][0]["input"] if entry["steps"] else ""
+            entry["output"] = "\n".join(step["output"] for step in entry["steps"])
+        return entries
+
+    def _dump_validation_generations(self, entries, dump_path):
+        """Dump validation trajectories as JSONL."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        with open(filename, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        print(f"Dumped validation generations to {filename}")
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -697,6 +767,7 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        validation_dump_entries = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -767,6 +838,7 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            validation_dump_entries.extend(self._build_validation_dump_entries(test_batch, scores))
 
             reward_tensor_lst.append(reward_tensor)
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
@@ -783,6 +855,9 @@ class RayPPOTrainer:
                         assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        validation_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if validation_data_dir:
+            self._dump_validation_generations(validation_dump_entries, validation_data_dir)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)

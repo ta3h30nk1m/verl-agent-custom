@@ -151,6 +151,8 @@ class WebshopValidationRunner:
             "human_goals": config.env.webshop.human_goals,
             "file_path": os.path.abspath(file_path),
             "attr_path": os.path.abspath(attr_path),
+            "val_goal_start": config.env.webshop.get("val_goal_start", 0),
+            "val_goal_end": config.env.webshop.get("val_goal_end", 500),
         }
         resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
         raw_val_envs = build_webshop_envs(

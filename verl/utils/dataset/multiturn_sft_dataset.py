@@ -36,6 +36,7 @@ class MultiTurnSFTDataset(Dataset):
         config = config or {}
         self.truncation = config.get("truncation", "error")
         self.max_length = config.get("max_length", 1024)
+        self.pad_to_max_length = config.get("pad_to_max_length", True)
         # Get messages_key from the new multiturn config structure
         multiturn_config = config.get("multiturn", {})
         self.messages_key = multiturn_config.get("messages_key", "messages")
@@ -109,7 +110,7 @@ class MultiTurnSFTDataset(Dataset):
 
         # Handle sequence length
         sequence_length = input_ids.shape[0]
-        if sequence_length < self.max_length:
+        if self.pad_to_max_length and sequence_length < self.max_length:
             # Pad sequences
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             padded_input_ids = torch.ones(size=(self.max_length - sequence_length,), dtype=input_ids.dtype) * pad_token_id
