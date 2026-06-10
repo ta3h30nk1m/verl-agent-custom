@@ -1,6 +1,8 @@
 # Important commands
 
-
+```bash
+pip install --no-cache-dir ray[default,cgraph]==2.43.0 timm
+```
 
 ## target model
 Made from Naver HyperclovaX 

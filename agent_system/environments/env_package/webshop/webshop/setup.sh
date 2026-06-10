@@ -22,10 +22,9 @@ if [ -z "$data" ]; then
 fi
 
 # Install Python Dependencies
-pip install -r requirements.txt;
+pip install --no-cache-dir -r requirements.txt;
 
-conda install mkl
-conda install -c conda-forge faiss-cpu
+conda install -c conda-forge "numpy=1.26.4" "mkl<2026" faiss-cpu
 
 # Install Environment Dependencies via `conda`
 # conda install -c pytorch faiss-cpu;
