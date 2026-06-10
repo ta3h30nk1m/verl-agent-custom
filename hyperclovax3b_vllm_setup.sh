@@ -2,10 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 BASE_ENV="${BASE_ENV:-verl-agent-webshop}"
 ENV_NAME="${ENV_NAME:-verl-agent-webshop-vllm3b}"
 VLLM_SRC="${VLLM_SRC:-${ROOT_DIR}/third_party/vllm-hyperclovax-vision-seed}"
+VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/NAVER-Cloud-HyperCLOVA-X/vllm.git}"
+VLLM_REPO_BRANCH="${VLLM_REPO_BRANCH:-v0.9.2rc2_hyperclovax_vision_seed}"
 RECREATE="${RECREATE:-0}"
 MAX_JOBS="${MAX_JOBS:-$(nproc)}"
 VLLM_SKIP_FA3="${VLLM_SKIP_FA3:-1}"
@@ -23,10 +26,57 @@ if ! command -v conda >/dev/null 2>&1; then
 fi
 
 if [[ ! -f "${VLLM_SRC}/setup.py" ]]; then
+    if [[ -e "${VLLM_SRC}" ]]; then
+        echo "vLLM source path exists but setup.py was not found: ${VLLM_SRC}" >&2
+        echo "Remove that path or set VLLM_SRC=/path/to/a/valid/vllm checkout." >&2
+        exit 1
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        echo "git was not found, but ${VLLM_SRC} needs to be cloned." >&2
+        exit 1
+    fi
+    echo "[setup] cloning patched HyperCLOVAX vLLM source"
+    mkdir -p "$(dirname "${VLLM_SRC}")"
+    git clone --branch "${VLLM_REPO_BRANCH}" --depth 1 "${VLLM_REPO_URL}" "${VLLM_SRC}"
+fi
+
+if [[ ! -f "${VLLM_SRC}/setup.py" ]]; then
     echo "vLLM source not found at ${VLLM_SRC}" >&2
     echo "Set VLLM_SRC=/path/to/vllm-hyperclovax-vision-seed if you keep it elsewhere." >&2
     exit 1
 fi
+
+ensure_vllm_skip_fa3_patch() {
+    if grep -q "VLLM_SKIP_FA3" "${VLLM_SRC}/setup.py"; then
+        return
+    fi
+
+    echo "[setup] patching vLLM setup.py to support VLLM_SKIP_FA3=1"
+    python - "${VLLM_SRC}/setup.py" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+source = path.read_text()
+old = '''    if envs.VLLM_USE_PRECOMPILED or get_nvcc_cuda_version() >= Version("12.3"):
+        ext_modules.append(
+            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+'''
+new = '''    skip_fa3 = os.environ.get("VLLM_SKIP_FA3", "0").lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+    if not skip_fa3 and (envs.VLLM_USE_PRECOMPILED
+                         or get_nvcc_cuda_version() >= Version("12.3")):
+        ext_modules.append(
+            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+'''
+if old not in source:
+    raise SystemExit("Could not patch setup.py automatically; FA3 block pattern was not found.")
+path.write_text(source.replace(old, new))
+PY
+}
+
+ensure_vllm_skip_fa3_patch
 
 env_exists() {
     conda env list | awk '{print $1}' | grep -qx "$1"
@@ -104,7 +154,8 @@ For HyperCLOVAX Vision eval, keep this in your shell or eval script:
   export HF_MODULES_CACHE=${ROOT_DIR}/.cache/huggingface/modules
 
 Useful rebuild options:
-  RECREATE=1 bash setup.sh
-  FORCE_REINSTALL_VLLM=1 bash setup.sh
-  VLLM_SRC=/path/to/vllm-hyperclovax-vision-seed bash setup.sh
+  RECREATE=1 bash ${SCRIPT_NAME}
+  FORCE_REINSTALL_VLLM=1 bash ${SCRIPT_NAME}
+  VLLM_SRC=/path/to/vllm-hyperclovax-vision-seed bash ${SCRIPT_NAME}
+  VLLM_REPO_BRANCH=<branch> bash ${SCRIPT_NAME}
 EOF
