@@ -73,6 +73,7 @@ def iter_records(path: Path) -> list[dict[str, Any]]:
 
 def find_split_files(raw_dir: Path, split: str) -> list[Path]:
     candidates = [
+        raw_dir / split,
         raw_dir / "data" / split,
         raw_dir / "Mind2Web" / "data" / split,
     ]
@@ -456,6 +457,32 @@ def build_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict
     return examples, stats
 
 
+def sample_balanced_validation(
+    grouped: dict[str, list[dict[str, Any]]],
+    *,
+    split_names: list[str],
+    ratio: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError(f"--balanced-val-ratio must be in (0, 1], got {ratio}")
+
+    rows: list[dict[str, Any]] = []
+    counts = {}
+    for split in split_names:
+        split_rows = list(grouped.get(split, []))
+        if not split_rows:
+            counts[split] = 0
+            continue
+        sample_size = max(1, int(len(split_rows) * ratio))
+        rng = random.Random(seed + stable_int(split))
+        indices = sorted(rng.sample(range(len(split_rows)), sample_size))
+        sampled = [split_rows[idx] for idx in indices]
+        rows.extend(sampled)
+        counts[split] = len(sampled)
+    return rows, counts
+
+
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w") as f:
         for row in rows:
@@ -483,9 +510,21 @@ def write_outputs(args: argparse.Namespace, examples: list[dict[str, Any]], stat
     for split in args.splits:
         grouped[split] = [row for row in examples if row["mind2web_split"] == split]
 
-    parquet_written = {}
+    balanced_val_counts = None
+    if args.balanced_val_ratio is not None:
+        balanced_val, balanced_val_counts = sample_balanced_validation(
+            grouped,
+            split_names=args.balanced_val_splits,
+            ratio=args.balanced_val_ratio,
+            seed=args.balanced_val_seed,
+        )
+        grouped[args.balanced_val_output_name] = balanced_val
+
     for name, rows in grouped.items():
         write_jsonl(args.output_dir / f"{name}.jsonl", rows)
+
+    parquet_written = {}
+    for name, rows in grouped.items():
         if args.write_parquet:
             parquet_written[name] = maybe_write_parquet(args.output_dir / f"{name}.parquet", rows)
             if rows and not parquet_written[name] and not args.allow_missing_parquet:
@@ -509,6 +548,10 @@ def write_outputs(args: argparse.Namespace, examples: list[dict[str, Any]], stat
         "max_html_chars": args.max_html_chars,
         "max_candidates": args.max_candidates,
         "shuffle_candidates": args.shuffle_candidates,
+        "balanced_val_ratio": args.balanced_val_ratio,
+        "balanced_val_splits": args.balanced_val_splits,
+        "balanced_val_output_name": args.balanced_val_output_name,
+        "balanced_val_counts": balanced_val_counts,
         "parquet_written": parquet_written,
         "format": {
             "messages": "chat messages for data.multiturn.messages_key=messages",
@@ -550,6 +593,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shuffle-candidates", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--limit-per-split", type=int, default=None)
+    parser.add_argument(
+        "--balanced-val-ratio",
+        type=float,
+        default=None,
+        help=(
+            "If set, sample this same fraction from each Mind2Web test split and "
+            "write it as a separate validation file."
+        ),
+    )
+    parser.add_argument(
+        "--balanced-val-splits",
+        nargs="+",
+        default=["test_task", "test_website", "test_domain"],
+        choices=["test_task", "test_website", "test_domain"],
+    )
+    parser.add_argument("--balanced-val-output-name", default="val_sample")
+    parser.add_argument("--balanced-val-seed", type=int, default=0)
     parser.add_argument("--write-parquet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--allow-missing-parquet",
