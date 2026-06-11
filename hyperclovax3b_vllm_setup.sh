@@ -9,16 +9,28 @@ ENV_NAME="${ENV_NAME:-verl-agent-webshop-vllm3b}"
 VLLM_SRC="${VLLM_SRC:-${ROOT_DIR}/third_party/vllm-hyperclovax-vision-seed}"
 VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/NAVER-Cloud-HyperCLOVA-X/vllm.git}"
 VLLM_REPO_BRANCH="${VLLM_REPO_BRANCH:-v0.9.2rc2_hyperclovax_vision_seed}"
+VLLM_VERSION="${VLLM_VERSION:-0.9.2rc2}"
 RECREATE="${RECREATE:-0}"
 MAX_JOBS="${MAX_JOBS:-$(nproc)}"
 VLLM_SKIP_FA3="${VLLM_SKIP_FA3:-1}"
 VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-0}"
 FORCE_REINSTALL_VLLM="${FORCE_REINSTALL_VLLM:-0}"
+CLEAN_VLLM_BUILD="${CLEAN_VLLM_BUILD:-1}"
+TORCH_VERSION="${TORCH_VERSION:-2.7.0}"
+TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.7.0}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.22.0}"
+RAY_VERSION="${RAY_VERSION:-2.43.0}"
+GRPCIO_VERSION="${GRPCIO_VERSION:-1.71.0}"
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.52.4}"
+HUGGINGFACE_HUB_VERSION="${HUGGINGFACE_HUB_VERSION:-0.33.0}"
 
 if ! command -v conda >/dev/null 2>&1; then
     CONDA_SH="${HOME}/miniforge3/etc/profile.d/conda.sh"
     if [[ ! -f "${CONDA_SH}" ]]; then
-        echo "conda was not found. Install miniforge/conda or set PATH first." >&2
+        CONDA_SH="${HOME}/anaconda3/etc/profile.d/conda.sh"
+    fi
+    if [[ ! -f "${CONDA_SH}" ]]; then
+        echo "conda was not found. Install conda or set PATH first." >&2
         exit 1
     fi
     # shellcheck disable=SC1090
@@ -53,26 +65,38 @@ ensure_vllm_skip_fa3_patch() {
 
     echo "[setup] patching vLLM setup.py to support VLLM_SKIP_FA3=1"
     python - "${VLLM_SRC}/setup.py" <<'PY'
+import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 source = path.read_text()
-old = '''    if envs.VLLM_USE_PRECOMPILED or get_nvcc_cuda_version() >= Version("12.3"):
-        ext_modules.append(
-            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
-'''
-new = '''    skip_fa3 = os.environ.get("VLLM_SKIP_FA3", "0").lower() in {
+
+marker = '    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))'
+start = source.find(marker)
+if start < 0:
+    raise SystemExit("Could not patch setup.py automatically; FA2 extension marker was not found.")
+
+replacement = '''    skip_fa3 = os.environ.get("VLLM_SKIP_FA3", "0").lower() in {
         "1", "true", "yes", "y", "on"
     }
     if not skip_fa3 and (envs.VLLM_USE_PRECOMPILED
                          or get_nvcc_cuda_version() >= Version("12.3")):
-        ext_modules.append(
-            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
 '''
-if old not in source:
-    raise SystemExit("Could not patch setup.py automatically; FA3 block pattern was not found.")
-path.write_text(source.replace(old, new))
+
+tail = source[start:]
+patterns = (
+    r'    if envs\.VLLM_USE_PRECOMPILED or get_nvcc_cuda_version\(\) >= Version\("12\.3"\):\n',
+    r'    if \(?envs\.VLLM_USE_PRECOMPILED\n\s+or get_nvcc_cuda_version\(\) >= Version\("12\.3"\)\)?:\n',
+)
+
+for pattern in patterns:
+    patched_tail, count = re.subn(pattern, replacement, tail, count=1)
+    if count:
+        path.write_text(source[:start] + patched_tail)
+        break
+else:
+    raise SystemExit("Could not patch setup.py automatically; FA3 condition pattern was not found.")
 PY
 }
 
@@ -99,22 +123,80 @@ else
     conda create -n "${ENV_NAME}" --clone "${BASE_ENV}" -y
 fi
 
-PIP_INSTALL_ARGS=(install --no-build-isolation -e "${VLLM_SRC}")
+mkdir -p "${ROOT_DIR}/.cache"
+CONSTRAINTS_FILE="${ROOT_DIR}/.cache/hyperclovax3b_vllm_constraints.txt"
+cat > "${CONSTRAINTS_FILE}" <<EOF
+torch==${TORCH_VERSION}
+torchaudio==${TORCHAUDIO_VERSION}
+torchvision==${TORCHVISION_VERSION}
+ray==${RAY_VERSION}
+grpcio==${GRPCIO_VERSION}
+transformers==${TRANSFORMERS_VERSION}
+huggingface-hub==${HUGGINGFACE_HUB_VERSION}
+EOF
+
+PIP_INSTALL_ARGS=(install --constraint "${CONSTRAINTS_FILE}" --no-build-isolation -e "${VLLM_SRC}")
 if [[ "${FORCE_REINSTALL_VLLM}" == "1" ]]; then
     PIP_INSTALL_ARGS+=(--force-reinstall)
 fi
 
-echo "[setup] installing patched HyperCLOVAX vLLM from ${VLLM_SRC}"
-env \
-    MAX_JOBS="${MAX_JOBS}" \
-    VLLM_SKIP_FA3="${VLLM_SKIP_FA3}" \
-    VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
+echo "[setup] removing incompatible packages from cloned env"
+conda run --no-capture-output -n "${ENV_NAME}" \
+    python -m pip uninstall -y vllm xformers flash-attn flash_attn || true
+
+echo "[setup] installing vLLM build requirements into ${ENV_NAME}"
+conda run --no-capture-output -n "${ENV_NAME}" \
+    python -m pip install --upgrade \
+    --constraint "${CONSTRAINTS_FILE}" \
+    "cmake>=3.26.1" \
+    "ninja" \
+    "packaging>=24.2,<26.0" \
+    "setuptools>=77.0.3,<80.0.0" \
+    "setuptools-scm>=8" \
+    "torch==${TORCH_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}" \
+    "ray[default,cgraph]==${RAY_VERSION}" \
+    "grpcio==${GRPCIO_VERSION}" \
+    "transformers==${TRANSFORMERS_VERSION}" \
+    "huggingface-hub[hf_xet]==${HUGGINGFACE_HUB_VERSION}" \
+    "wheel" \
+    "jinja2>=3.1.6" \
+    "regex"
+
+if [[ "${CLEAN_VLLM_BUILD}" == "1" ]]; then
+    echo "[setup] removing stale vLLM native build artifacts"
     conda run --no-capture-output -n "${ENV_NAME}" \
+        python -m pip uninstall -y vllm || true
+    find "${VLLM_SRC}" \
+        -type f \
+        \( -name "*.so" -o -name "*.abi3.so" \) \
+        -not -path "${VLLM_SRC}/.git/*" \
+        -print -delete
+    rm -rf \
+        "${VLLM_SRC}/build" \
+        "${VLLM_SRC}/dist" \
+        "${VLLM_SRC}"/*.egg-info \
+        "${VLLM_SRC}/.eggs"
+fi
+
+echo "[setup] installing patched HyperCLOVAX vLLM from ${VLLM_SRC}"
+export MAX_JOBS
+export VLLM_SKIP_FA3
+if [[ "${VLLM_USE_PRECOMPILED}" =~ ^(1|true|TRUE|yes|YES|y|Y|on|ON)$ ]]; then
+    export VLLM_USE_PRECOMPILED
+else
+    unset VLLM_USE_PRECOMPILED
+    unset VLLM_PRECOMPILED_WHEEL_LOCATION
+fi
+export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION}"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="${VLLM_VERSION}"
+conda run --no-capture-output -n "${ENV_NAME}" \
     python -m pip "${PIP_INSTALL_ARGS[@]}"
 
 echo "[setup] pinning packages known to work with the patched vLLM build"
 conda run --no-capture-output -n "${ENV_NAME}" \
-    python -m pip install "mistral_common==1.6.2"
+    python -m pip install --constraint "${CONSTRAINTS_FILE}" "mistral_common==1.6.2"
 
 # External flash-attn wheels can be ABI-incompatible with this Torch/vLLM pair.
 # vLLM's in-tree flash-attention extension is used instead.
@@ -158,4 +240,6 @@ Useful rebuild options:
   FORCE_REINSTALL_VLLM=1 bash ${SCRIPT_NAME}
   VLLM_SRC=/path/to/vllm-hyperclovax-vision-seed bash ${SCRIPT_NAME}
   VLLM_REPO_BRANCH=<branch> bash ${SCRIPT_NAME}
+  VLLM_VERSION=0.9.2rc2 bash ${SCRIPT_NAME}
+  CLEAN_VLLM_BUILD=0 bash ${SCRIPT_NAME}
 EOF

@@ -64,9 +64,17 @@ LORA_ALPHA=${LORA_ALPHA:-128}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 LORA_TARGET_SCOPE=${LORA_TARGET_SCOPE:-llm}
 
+if [ -z "${SAVE_PATH_SUFFIX+x}" ]; then
+    SAVE_PATH_SUFFIX="ep${TOTAL_EPOCHS}_lr${LR}_r${LORA_RANK}"
+fi
+if [ -n "${SAVE_PATH_SUFFIX}" ]; then
+    save_path="${save_path}_${SAVE_PATH_SUFFIX}"
+fi
+
 LOSS_VAL_ENABLE=${LOSS_VAL_ENABLE:-true}
 LOSS_VAL_FREQ=${LOSS_VAL_FREQ:--1}
 LOSS_VAL_BEFORE_TRAIN=${LOSS_VAL_BEFORE_TRAIN:-false}
+SAVE_FREQ=${SAVE_FREQ:--1}
 
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-mind2web-hyperclovax-lora-r${LORA_RANK}-sp${SP_SIZE}}
 LOGGER=${LOGGER:-"['console','wandb']"}
@@ -95,6 +103,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="${nproc_per_node}" \
     trainer.project_name=mind2web-sft \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
+    trainer.save_freq="${SAVE_FREQ}" \
     trainer.loss_validation_enable="${LOSS_VAL_ENABLE}" \
     trainer.test_freq="${LOSS_VAL_FREQ}" \
     trainer.val_before_train="${LOSS_VAL_BEFORE_TRAIN}" \

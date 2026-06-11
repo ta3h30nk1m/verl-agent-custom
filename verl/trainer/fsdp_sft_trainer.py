@@ -707,6 +707,7 @@ class FSDPSFTTrainer:
                 if loss_validation_enable and test_freq > 0 and (is_last_step or global_step % test_freq == 0):
                     self._validate_and_log(tracking=tracking if rank == 0 else None, step=global_step)
 
+                checkpoint_path = None
                 did_online_validation = False
                 online_freq = self.config.trainer.get("online_webshop_validation", {}).get("freq", -1)
                 if online_freq > 0 and global_step % online_freq == 0:
@@ -719,11 +720,17 @@ class FSDPSFTTrainer:
                     last_online_validation_step = global_step
                     did_online_validation = True
 
+                save_freq = self.config.trainer.get("save_freq", -1)
+                if save_freq > 0 and (is_last_step or global_step % save_freq == 0):
+                    if checkpoint_path is None:
+                        checkpoint_path = self.save_checkpoint(step=global_step)
+
                 # for early exit validation
                 if is_last_step:
                     # Save final checkpoint
-                    if not did_online_validation:
+                    if checkpoint_path is None:
                         checkpoint_path = self.save_checkpoint(step=global_step)
+                    if not did_online_validation:
                         self._run_online_webshop_validation(
                             tracking=tracking if rank == 0 else None,
                             step=global_step,
@@ -736,9 +743,13 @@ class FSDPSFTTrainer:
                 self._validate_and_log(tracking=tracking if rank == 0 else None, step=global_step)
 
             # save checkpoint
-            checkpoint_path = self.save_checkpoint(step=global_step)
+            checkpoint_path = None
+            if self.config.trainer.get("save_freq", -1) <= 0:
+                checkpoint_path = self.save_checkpoint(step=global_step)
             online_freq = self.config.trainer.get("online_webshop_validation", {}).get("freq", -1)
             if online_freq > 0 and global_step % online_freq == 0 and last_online_validation_step != global_step:
+                if checkpoint_path is None:
+                    checkpoint_path = self.save_checkpoint(step=global_step)
                 self._run_online_webshop_validation(
                     tracking=tracking if rank == 0 else None,
                     step=global_step,
