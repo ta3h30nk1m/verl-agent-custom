@@ -37,8 +37,30 @@ model:
   lora_alpha: 16  # LoRA scaling factor
   target_modules: all-linear  # Target modules for LoRA adaptation
   lora_target_scope: all  # all, llm, or llm_attention. llm* excludes vision/audio encoders, projectors, embeddings, and heads.
+  lora_adapter_path: null  # Optional PEFT adapter path to use as LoRA initialization
   use_liger: False
   strategy: fsdp2
+teacher:
+  enable: false
+  model_path: null
+  lora_adapter_path: null
+  external_lib: null
+  trust_remote_code: True
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+distillation:
+  loss_type: rkl  # fkl, rkl, jsd, jsd_0.7, skew_fkl, skew_rkl
+  temperature: 1.0
+  jsd_beta: 0.5
+  skew_alpha: 0.1
+  kd_coeff: 0.0  # loss = sft_loss + kd_coeff * kd_loss when non-zero
+  kd_balancing_coeff: 0.0  # loss = (1 - coeff) * sft_loss + coeff * kd_loss when non-zero
+beta_kd:
+  losses: fkl  # comma/plus separated: fkl,rkl,js,tvd,mse_probs,mse_logits,cosine_probs,cosine_logits
+  temperature: 1.0
+  weighting: instance  # equal, task, instance
+  weight_ce: false
+  hidden_dim: 16
 optim:
   lr: 1e-5
   betas: [0.9, 0.95]

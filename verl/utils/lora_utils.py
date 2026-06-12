@@ -105,6 +105,12 @@ def _find_language_layer_prefixes(model: nn.Module) -> list[str]:
     return deepest
 
 
+def find_language_layer_prefixes(model: nn.Module) -> list[str]:
+    """Return deepest language-model layer container prefixes."""
+
+    return _find_language_layer_prefixes(model)
+
+
 def _is_under_any_prefix(name: str, prefixes: list[str]) -> bool:
     return any(name.startswith(f"{prefix}.") for prefix in prefixes)
 

@@ -34,7 +34,7 @@ from contextlib import nullcontext
 import hydra
 import torch
 import torch.distributed
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch import nn, optim
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -80,6 +80,10 @@ elif is_npu_available:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
+
+
+def _is_lora_enabled(model_config):
+    return model_config.get("lora_rank", 0) > 0 or model_config.get("lora_adapter_path", None) is not None
 
 
 def extract_step(path):
@@ -250,28 +254,34 @@ class FSDPSFTTrainer:
 
                 _apply_liger_kernel_to_instance(model=self.model)
 
-            if self.config.model.get("lora_rank", 0) > 0:
+            lora_adapter_path = self.config.model.get("lora_adapter_path", None)
+            if _is_lora_enabled(self.config.model):
                 self.model.enable_input_require_grads()
-                target_modules = resolve_lora_target_modules(
-                    self.model,
-                    convert_to_regular_types(self.config.model.target_modules),
-                    self.config.model.get("lora_target_scope", "all"),
-                )
-                if self.device_mesh.get_rank() == 0:
-                    print(
-                        "Applying LoRA to SFT model: "
-                        f"target_scope={self.config.model.get('lora_target_scope', 'all')}, "
-                        f"num_target_modules={len(target_modules) if isinstance(target_modules, list) else target_modules}"
+                if lora_adapter_path is not None:
+                    if self.device_mesh.get_rank() == 0:
+                        print(f"Loading LoRA adapter initialization from {lora_adapter_path}")
+                    self.model = PeftModel.from_pretrained(self.model, lora_adapter_path, is_trainable=True)
+                else:
+                    target_modules = resolve_lora_target_modules(
+                        self.model,
+                        convert_to_regular_types(self.config.model.target_modules),
+                        self.config.model.get("lora_target_scope", "all"),
                     )
-                # Convert config to regular Python types before creating PEFT model
-                lora_config = {
-                    "task_type": TaskType.CAUSAL_LM,
-                    "r": self.config.model.lora_rank,
-                    "lora_alpha": self.config.model.lora_alpha,
-                    "target_modules": target_modules,
-                    "bias": "none",
-                }
-                self.model = get_peft_model(self.model, LoraConfig(**lora_config))
+                    if self.device_mesh.get_rank() == 0:
+                        print(
+                            "Applying LoRA to SFT model: "
+                            f"target_scope={self.config.model.get('lora_target_scope', 'all')}, "
+                            f"num_target_modules={len(target_modules) if isinstance(target_modules, list) else target_modules}"
+                        )
+                    # Convert config to regular Python types before creating PEFT model
+                    lora_config = {
+                        "task_type": TaskType.CAUSAL_LM,
+                        "r": self.config.model.lora_rank,
+                        "lora_alpha": self.config.model.lora_alpha,
+                        "target_modules": target_modules,
+                        "bias": "none",
+                    }
+                    self.model = get_peft_model(self.model, LoraConfig(**lora_config))
 
             normalize_floating_module_dtype(self.model, torch.float32)
 
@@ -285,7 +295,7 @@ class FSDPSFTTrainer:
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
             config=self.config.model.fsdp_config.wrap_policy,
-            is_lora=self.config.model.get("lora_rank", 0) > 0,
+            is_lora=_is_lora_enabled(self.config.model),
         )
         if self.device_mesh.get_rank() == 0:
             print(auto_wrap_policy)
@@ -592,7 +602,7 @@ class FSDPSFTTrainer:
                 "--num-cpus-per-env-worker",
                 str(online_config.get("num_cpus_per_env_worker", 0.1)),
             ]
-            if self.config.model.get("lora_rank", 0) > 0:
+            if _is_lora_enabled(self.config.model):
                 command.extend(["--lora-adapter", checkpoint_path])
 
             env = os.environ.copy()
