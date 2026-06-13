@@ -33,7 +33,20 @@ def _str_to_bool(value: Any) -> bool:
     raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}")
 
 
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
 def _safe_json_dumps(value: Any, **kwargs: Any) -> str:
+    kwargs.setdefault("default", _json_default)
     return json.dumps(value, **kwargs).encode("utf-8", "backslashreplace").decode("utf-8")
 
 
