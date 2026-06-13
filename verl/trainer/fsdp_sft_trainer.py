@@ -357,6 +357,8 @@ class FSDPSFTTrainer:
 
         self.steps_per_epoch = len(self.train_dataloader)
         self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+        if self.config.trainer.total_training_steps is not None:
+            self.total_steps = self.config.trainer.total_training_steps
 
         if self.device_mesh.get_rank() == 0:
             print(f"Number of steps/epoch {self.steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {self.total_steps}")

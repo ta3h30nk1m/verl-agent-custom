@@ -35,6 +35,17 @@ def _apply_chat_template(tokenizer, messages, enable_thinking):
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
+def _stop_token_ids(tokenizer):
+    token_ids = []
+    for token in ("<|im_end|>", "<|endofturn|>", "<|stop|>"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None and token_id != tokenizer.unk_token_id:
+            token_ids.append(token_id)
+    if tokenizer.eos_token_id is not None:
+        token_ids.append(tokenizer.eos_token_id)
+    return sorted(set(token_ids))
+
+
 def _default_backend():
     if "INFERENCE_BACKEND" in os.environ:
         return os.environ["INFERENCE_BACKEND"]
@@ -256,7 +267,7 @@ class HFGenerator:
             "max_new_tokens": self.args.max_new_tokens,
             "do_sample": self.args.do_sample,
             "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
+            "eos_token_id": _stop_token_ids(self.tokenizer) or self.tokenizer.eos_token_id,
         }
         if self.args.do_sample:
             generate_kwargs["temperature"] = self.args.temperature
@@ -286,6 +297,8 @@ class VLLMGenerator:
             max_tokens=args.max_new_tokens,
             temperature=args.temperature if args.do_sample else 0.0,
             top_p=args.top_p,
+            truncate_prompt_tokens=args.max_prompt_length,
+            stop_token_ids=_stop_token_ids(tokenizer),
         )
         self.llm = LLM(
             model=vllm_model_path,
@@ -304,7 +317,26 @@ class VLLMGenerator:
             _apply_chat_template(self.tokenizer, messages, self.args.enable_thinking)
             for messages in message_batches
         ]
-        outputs = self.llm.generate(formatted_prompts, self.sampling_params, use_tqdm=False)
+        max_prompt_length = min(
+            self.args.max_prompt_length,
+            self.args.vllm_max_model_len - self.args.max_new_tokens,
+        )
+        if max_prompt_length < 1:
+            raise ValueError(
+                f"vLLM max_model_len={self.args.vllm_max_model_len} is too small for "
+                f"max_new_tokens={self.args.max_new_tokens}."
+            )
+        tokenized_prompts = self.tokenizer(
+            formatted_prompts,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_prompt_length,
+        )["input_ids"]
+        outputs = self.llm.generate(
+            [{"prompt_token_ids": input_ids} for input_ids in tokenized_prompts],
+            self.sampling_params,
+            use_tqdm=False,
+        )
         return [
             {"input": formatted, "raw_output": output.outputs[0].text.strip()}
             for formatted, output in zip(formatted_prompts, outputs)
@@ -331,6 +363,10 @@ def _load_rows(path):
             raise RuntimeError("pandas/pyarrow are required to read parquet eval data.") from exc
         return pd.read_parquet(path).to_dict(orient="records")
     raise ValueError(f"Unsupported eval data suffix: {path}")
+
+
+def _safe_json_dumps(value, **kwargs):
+    return json.dumps(value, **kwargs).encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _messages_without_answer(row):
@@ -513,7 +549,7 @@ def main():
                     **score,
                 }
                 results.append(record)
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(_safe_json_dumps(record, ensure_ascii=False) + "\n")
 
             done = min(start + len(batch), len(rows))
             answerable = [item for item in results if item["target_id_answerable"]]
@@ -547,9 +583,9 @@ def main():
         "model_path": args.model_path,
         "lora_adapter": args.lora_adapter,
     }
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    (output_dir / "summary.json").write_text(_safe_json_dumps(summary, indent=2, ensure_ascii=False) + "\n")
     print(f"Saved predictions to {predictions_path}")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(_safe_json_dumps(summary, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
