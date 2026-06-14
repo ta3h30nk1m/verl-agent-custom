@@ -63,6 +63,7 @@ LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-128}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 LORA_TARGET_SCOPE=${LORA_TARGET_SCOPE:-llm}
+LORA_ADAPTER_PATH=${LORA_ADAPTER_PATH:-null}
 
 if [ -z "${SAVE_PATH_SUFFIX+x}" ]; then
     SAVE_PATH_SUFFIX="ep${TOTAL_EPOCHS}_lr${LR}_r${LORA_RANK}"
@@ -96,6 +97,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="${nproc_per_node}" \
     model.lora_alpha="${LORA_ALPHA}" \
     model.target_modules="${LORA_TARGET_MODULES}" \
     model.lora_target_scope="${LORA_TARGET_SCOPE}" \
+    model.lora_adapter_path="${LORA_ADAPTER_PATH}" \
     model.trust_remote_code=true \
     optim.lr="${LR}" \
     optim.warmup_steps_ratio=0.03 \

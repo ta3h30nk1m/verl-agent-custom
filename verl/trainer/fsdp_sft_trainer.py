@@ -83,7 +83,15 @@ logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
 def _is_lora_enabled(model_config):
-    return model_config.get("lora_rank", 0) > 0 or model_config.get("lora_adapter_path", None) is not None
+    return model_config.get("lora_rank", 0) > 0 or _none_if_null(model_config.get("lora_adapter_path", None)) is not None
+
+
+def _none_if_null(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return value
 
 
 def extract_step(path):
@@ -254,7 +262,7 @@ class FSDPSFTTrainer:
 
                 _apply_liger_kernel_to_instance(model=self.model)
 
-            lora_adapter_path = self.config.model.get("lora_adapter_path", None)
+            lora_adapter_path = _none_if_null(self.config.model.get("lora_adapter_path", None))
             if _is_lora_enabled(self.config.model):
                 self.model.enable_input_require_grads()
                 if lora_adapter_path is not None:

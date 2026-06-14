@@ -9,6 +9,7 @@ fi
 
 nproc_per_node=$1
 save_path=$2
+LORA_ADAPTER_PATH=${LORA_ADAPTER_PATH:-null}
 
 # Shift the arguments so $@ refers to the rest
 shift 2
@@ -32,7 +33,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.default_hdfs_dir=null $@ \
     model.lora_rank=32\
     model.lora_alpha=16 \
-    model.target_modules=all-linear
+    model.target_modules=all-linear \
+    model.lora_adapter_path="${LORA_ADAPTER_PATH}"
 
     # Or you can do this:
     # model.target_modules=[q_proj,v_proj] \
