@@ -299,6 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-enforce-eager", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_ENFORCE_EAGER", "false")))
     parser.add_argument("--vllm-merged-model-dir", default=os.environ.get("VLLM_MERGED_MODEL_DIR", ""))
     parser.add_argument("--vllm-force-merge-lora", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_FORCE_MERGE_LORA", "false")))
+    parser.add_argument("--vllm-cleanup-merged-model", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_CLEANUP_MERGED_MODEL", "true")))
     return parser.parse_args()
 
 
@@ -306,97 +307,103 @@ def main() -> None:
     args = parse_args()
     import torch
     from transformers import AutoTokenizer
-    from examples.validation.mind2web_llm_eval import _make_generator
+    from examples.validation.mind2web_llm_eval import _cleanup_vllm_merged_model, _make_generator
 
     torch.manual_seed(0)
+    generator = None
 
-    rows = _take_eval_rows(_load_rows(args.eval_file), args)
-    if not rows:
-        raise ValueError(f"No eval rows selected from {args.eval_file}.")
+    try:
+        rows = _take_eval_rows(_load_rows(args.eval_file), args)
+        if not rows:
+            raise ValueError(f"No eval rows selected from {args.eval_file}.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    generator = _make_generator(args, tokenizer)
+        generator = _make_generator(args, tokenizer)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    predictions_path = output_dir / "predictions.jsonl"
-    results = []
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        predictions_path = output_dir / "predictions.jsonl"
+        results = []
 
-    with predictions_path.open("w", encoding="utf-8") as f:
-        for start in range(0, len(rows), args.batch_size):
-            batch = rows[start:start + args.batch_size]
-            generated = generator.generate([_messages_without_answer(row) for row in batch])
+        with predictions_path.open("w", encoding="utf-8") as f:
+            for start in range(0, len(rows), args.batch_size):
+                batch = rows[start:start + args.batch_size]
+                generated = generator.generate([_messages_without_answer(row) for row in batch])
 
-            for offset, (row, gen) in enumerate(zip(batch, generated)):
-                gold, gold_error = _parse_jsonish(_gold_response(row))
-                if gold_error:
-                    raise ValueError(f"Could not parse gold response at row {start + offset}: {_gold_response(row)!r}")
-                pred, parse_error = _parse_jsonish(gen["raw_output"])
-                task_type = row.get("task_type") or (args.task[0] if args.task else "unknown")
-                score = _score(task_type, pred, gold)
-                record = {
-                    "index": args.start_index + start + offset,
-                    "task_type": task_type,
-                    "product_id": row.get("product_id"),
-                    "category": row.get("category"),
-                    "attribute": row.get("attribute"),
-                    "target_attributes": row.get("target_attributes"),
-                    "gold": gold,
-                    "prediction": pred,
-                    "parse_error": parse_error,
-                    "raw_output": gen["raw_output"],
-                    "input": gen["input"],
-                    **score,
-                }
-                results.append(record)
-                f.write(_safe_json_dumps(record, ensure_ascii=False) + "\n")
+                for offset, (row, gen) in enumerate(zip(batch, generated)):
+                    gold, gold_error = _parse_jsonish(_gold_response(row))
+                    if gold_error:
+                        raise ValueError(f"Could not parse gold response at row {start + offset}: {_gold_response(row)!r}")
+                    pred, parse_error = _parse_jsonish(gen["raw_output"])
+                    task_type = row.get("task_type") or (args.task[0] if args.task else "unknown")
+                    score = _score(task_type, pred, gold)
+                    record = {
+                        "index": args.start_index + start + offset,
+                        "task_type": task_type,
+                        "product_id": row.get("product_id"),
+                        "category": row.get("category"),
+                        "attribute": row.get("attribute"),
+                        "target_attributes": row.get("target_attributes"),
+                        "gold": gold,
+                        "prediction": pred,
+                        "parse_error": parse_error,
+                        "raw_output": gen["raw_output"],
+                        "input": gen["input"],
+                        **score,
+                    }
+                    results.append(record)
+                    f.write(_safe_json_dumps(record, ensure_ascii=False) + "\n")
 
-            done = min(start + len(batch), len(rows))
-            primary_acc = sum(item["primary_correct"] for item in results) / len(results)
-            exact_acc = sum(item["exact_match"] for item in results) / len(results)
-            print(f"[{done}/{len(rows)}] primary_acc={primary_acc:.4f} exact_match={exact_acc:.4f}", flush=True)
+                done = min(start + len(batch), len(rows))
+                primary_acc = sum(item["primary_correct"] for item in results) / len(results)
+                exact_acc = sum(item["exact_match"] for item in results) / len(results)
+                print(f"[{done}/{len(rows)}] primary_acc={primary_acc:.4f} exact_match={exact_acc:.4f}", flush=True)
 
-    task_groups = defaultdict(list)
-    for item in results:
-        task_groups[item["task_type"]].append(item)
+        task_groups = defaultdict(list)
+        for item in results:
+            task_groups[item["task_type"]].append(item)
 
-    by_task = {}
-    for task_type, items in sorted(task_groups.items()):
-        by_task[task_type] = {
-            "num_examples": len(items),
-            "primary_acc": sum(item["primary_correct"] for item in items) / len(items),
-            "exact_match": sum(item["exact_match"] for item in items) / len(items),
-            "json_parse_error_rate": sum(1 for item in items if item["parse_error"]) / len(items),
+        by_task = {}
+        for task_type, items in sorted(task_groups.items()):
+            by_task[task_type] = {
+                "num_examples": len(items),
+                "primary_acc": sum(item["primary_correct"] for item in items) / len(items),
+                "exact_match": sum(item["exact_match"] for item in items) / len(items),
+                "json_parse_error_rate": sum(1 for item in items if item["parse_error"]) / len(items),
+            }
+            metric_keys = sorted(
+                key
+                for key in set().union(*(item.keys() for item in items))
+                if key.endswith("_match") or key.endswith("_exact") or key.endswith("_accuracy")
+            )
+            for key in metric_keys:
+                values = [item[key] for item in items if isinstance(item.get(key), (bool, int, float))]
+                if values:
+                    by_task[task_type][key] = sum(values) / len(values)
+
+        summary = {
+            "eval_file": args.eval_file,
+            "num_examples": len(results),
+            "primary_acc": sum(item["primary_correct"] for item in results) / len(results),
+            "exact_match": sum(item["exact_match"] for item in results) / len(results),
+            "json_parse_error_rate": sum(1 for item in results if item["parse_error"]) / len(results),
+            "by_task": by_task,
+            "parse_errors": dict(Counter(item["parse_error"] for item in results if item["parse_error"])),
+            "backend": args.backend,
+            "model_path": args.model_path,
+            "lora_adapter": args.lora_adapter,
         }
-        metric_keys = sorted(
-            key
-            for key in set().union(*(item.keys() for item in items))
-            if key.endswith("_match") or key.endswith("_exact") or key.endswith("_accuracy")
-        )
-        for key in metric_keys:
-            values = [item[key] for item in items if isinstance(item.get(key), (bool, int, float))]
-            if values:
-                by_task[task_type][key] = sum(values) / len(values)
-
-    summary = {
-        "eval_file": args.eval_file,
-        "num_examples": len(results),
-        "primary_acc": sum(item["primary_correct"] for item in results) / len(results),
-        "exact_match": sum(item["exact_match"] for item in results) / len(results),
-        "json_parse_error_rate": sum(1 for item in results if item["parse_error"]) / len(results),
-        "by_task": by_task,
-        "parse_errors": dict(Counter(item["parse_error"] for item in results if item["parse_error"])),
-        "backend": args.backend,
-        "model_path": args.model_path,
-        "lora_adapter": args.lora_adapter,
-    }
-    (output_dir / "summary.json").write_text(_safe_json_dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"Saved predictions to {predictions_path}")
-    print(_safe_json_dumps(summary, indent=2, ensure_ascii=False))
+        (output_dir / "summary.json").write_text(_safe_json_dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Saved predictions to {predictions_path}")
+        print(_safe_json_dumps(summary, indent=2, ensure_ascii=False))
+    finally:
+        if generator is not None and hasattr(generator, "close"):
+            generator.close()
+        _cleanup_vllm_merged_model(args)
 
 
 if __name__ == "__main__":

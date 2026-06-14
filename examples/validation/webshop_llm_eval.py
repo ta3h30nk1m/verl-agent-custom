@@ -132,6 +132,21 @@ def _default_merged_model_dir(args):
     return Path(args.output_dir) / f"merged_lora_for_vllm_{digest}"
 
 
+_MERGED_LORA_METADATA = ".vllm_merged_lora_metadata.json"
+
+
+def _write_merged_lora_metadata(args, output_dir):
+    metadata = {
+        "model_path": args.model_path,
+        "lora_adapter": str(Path(args.lora_adapter).resolve()) if args.lora_adapter else "",
+    }
+    (Path(output_dir) / _MERGED_LORA_METADATA).write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def _has_merged_lora_metadata(path):
+    return (Path(path) / _MERGED_LORA_METADATA).is_file()
+
+
 def _iter_hf_hub_cache_dirs():
     seen = set()
     for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
@@ -262,12 +277,40 @@ def _merge_lora_for_vllm(args, tokenizer):
     merged_model.save_pretrained(tmp_dir, safe_serialization=True)
     tokenizer.save_pretrained(tmp_dir)
     _save_processor_if_available(args, tmp_dir)
+    _write_merged_lora_metadata(args, tmp_dir)
 
     if merged_dir.exists():
         shutil.rmtree(merged_dir)
     tmp_dir.rename(merged_dir)
     print(f"[vllm] saved merged model for vLLM: {merged_dir}", flush=True)
     return str(merged_dir)
+
+
+def _cleanup_vllm_merged_model(args):
+    if not getattr(args, "vllm_cleanup_merged_model", True):
+        return
+    if getattr(args, "backend", None) != "vllm" or not getattr(args, "lora_adapter", None):
+        return
+
+    model_path = getattr(args, "_vllm_model_path", "")
+    if not model_path or model_path == args.model_path:
+        return
+
+    merged_dir = Path(model_path)
+    expected_dir = Path(args.vllm_merged_model_dir) if args.vllm_merged_model_dir else _default_merged_model_dir(args)
+    if merged_dir.resolve(strict=False) != expected_dir.resolve(strict=False):
+        print(f"[vllm] skip cleanup for unexpected merged model path: {merged_dir}", flush=True)
+        return
+    if not merged_dir.exists():
+        return
+
+    is_default_dir = not args.vllm_merged_model_dir and merged_dir.name.startswith("merged_lora_for_vllm_")
+    if not is_default_dir and not _has_merged_lora_metadata(merged_dir):
+        print(f"[vllm] keeping custom merged model without cleanup metadata: {merged_dir}", flush=True)
+        return
+
+    shutil.rmtree(merged_dir)
+    print(f"[vllm] removed merged model after eval: {merged_dir}", flush=True)
 
 
 class HFGenerator:
@@ -361,6 +404,10 @@ class VLLMGenerator:
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,
             enforce_eager=args.vllm_enforce_eager,
         )
+
+    def close(self):
+        if hasattr(self, "llm"):
+            del self.llm
 
     def generate_actions(self, prompts):
         formatted_prompts = [
@@ -591,6 +638,7 @@ def parse_args():
     parser.add_argument("--vllm-enforce-eager", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_ENFORCE_EAGER", "false")))
     parser.add_argument("--vllm-merged-model-dir", default=os.environ.get("VLLM_MERGED_MODEL_DIR", ""))
     parser.add_argument("--vllm-force-merge-lora", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_FORCE_MERGE_LORA", "false")))
+    parser.add_argument("--vllm-cleanup-merged-model", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_CLEANUP_MERGED_MODEL", "true")))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("SEED", 0)))
     parser.add_argument("--ray-num-cpus", type=int, default=int(os.environ.get("RAY_NUM_CPUS", 2)))
     parser.add_argument("--num-cpus-per-env-worker", type=float, default=float(os.environ.get("NUM_CPUS_PER_ENV_WORKER", 0.1)))
@@ -605,26 +653,28 @@ def main():
     if args.parallel_envs < 1:
         raise ValueError(f"--parallel-envs must be >= 1, got {args.parallel_envs}.")
     torch.manual_seed(args.seed)
-
-    if not ray.is_initialized():
-        ray.init(num_cpus=args.ray_num_cpus, num_gpus=0, include_dashboard=False)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    generator = _make_generator(args, tokenizer)
-
-    config = _make_config(args)
-    env = _make_env(args, config)
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "episodes.jsonl"
-    results = []
+    generator = None
+    env = None
 
     try:
+        if not ray.is_initialized():
+            ray.init(num_cpus=args.ray_num_cpus, num_gpus=0, include_dashboard=False)
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        generator = _make_generator(args, tokenizer)
+
+        config = _make_config(args)
+        env = _make_env(args, config)
+
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "episodes.jsonl"
+        results = []
+
         with output_path.open("w") as f:
             episode_index = 0
             while episode_index < args.num_episodes:
@@ -640,21 +690,25 @@ def main():
                     )
                 f.flush()
                 episode_index += batch_size
-    finally:
-        env.envs.close()
 
-    summary = {
-        "num_episodes": len(results),
-        "goal_start": args.goal_start,
-        "goal_end": args.goal_end,
-        "parallel_envs": args.parallel_envs,
-        "mean_score": sum(result["score"] for result in results) / len(results) if results else 0.0,
-        "success_rate": sum(1.0 for result in results if result["won"]) / len(results) if results else 0.0,
-        "mean_episode_length": sum(result["episode_length"] for result in results) / len(results) if results else 0.0,
-    }
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
-    print(f"Saved episodes to {output_path}")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+        summary = {
+            "num_episodes": len(results),
+            "goal_start": args.goal_start,
+            "goal_end": args.goal_end,
+            "parallel_envs": args.parallel_envs,
+            "mean_score": sum(result["score"] for result in results) / len(results) if results else 0.0,
+            "success_rate": sum(1.0 for result in results if result["won"]) / len(results) if results else 0.0,
+            "mean_episode_length": sum(result["episode_length"] for result in results) / len(results) if results else 0.0,
+        }
+        (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        print(f"Saved episodes to {output_path}")
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    finally:
+        if env is not None:
+            env.envs.close()
+        if generator is not None and hasattr(generator, "close"):
+            generator.close()
+        _cleanup_vllm_merged_model(args)
 
 
 if __name__ == "__main__":

@@ -97,6 +97,21 @@ def _default_merged_model_dir(args):
     return Path(args.output_dir) / f"merged_lora_for_vllm_{digest}"
 
 
+_MERGED_LORA_METADATA = ".vllm_merged_lora_metadata.json"
+
+
+def _write_merged_lora_metadata(args, output_dir):
+    metadata = {
+        "model_path": args.model_path,
+        "lora_adapter": str(Path(args.lora_adapter).resolve()) if args.lora_adapter else "",
+    }
+    (Path(output_dir) / _MERGED_LORA_METADATA).write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def _has_merged_lora_metadata(path):
+    return (Path(path) / _MERGED_LORA_METADATA).is_file()
+
+
 def _iter_hf_hub_cache_dirs():
     seen = set()
     for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
@@ -224,12 +239,40 @@ def _merge_lora_for_vllm(args, tokenizer):
     merged_model.save_pretrained(tmp_dir, safe_serialization=True)
     tokenizer.save_pretrained(tmp_dir)
     _save_processor_if_available(args, tmp_dir)
+    _write_merged_lora_metadata(args, tmp_dir)
 
     if merged_dir.exists():
         shutil.rmtree(merged_dir)
     tmp_dir.rename(merged_dir)
     print(f"[vllm] saved merged model for vLLM: {merged_dir}", flush=True)
     return str(merged_dir)
+
+
+def _cleanup_vllm_merged_model(args):
+    if not getattr(args, "vllm_cleanup_merged_model", True):
+        return
+    if getattr(args, "backend", None) != "vllm" or not getattr(args, "lora_adapter", None):
+        return
+
+    model_path = getattr(args, "_vllm_model_path", "")
+    if not model_path or model_path == args.model_path:
+        return
+
+    merged_dir = Path(model_path)
+    expected_dir = Path(args.vllm_merged_model_dir) if args.vllm_merged_model_dir else _default_merged_model_dir(args)
+    if merged_dir.resolve(strict=False) != expected_dir.resolve(strict=False):
+        print(f"[vllm] skip cleanup for unexpected merged model path: {merged_dir}", flush=True)
+        return
+    if not merged_dir.exists():
+        return
+
+    is_default_dir = not args.vllm_merged_model_dir and merged_dir.name.startswith("merged_lora_for_vllm_")
+    if not is_default_dir and not _has_merged_lora_metadata(merged_dir):
+        print(f"[vllm] keeping custom merged model without cleanup metadata: {merged_dir}", flush=True)
+        return
+
+    shutil.rmtree(merged_dir)
+    print(f"[vllm] removed merged model after eval: {merged_dir}", flush=True)
 
 
 class HFGenerator:
@@ -311,6 +354,10 @@ class VLLMGenerator:
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,
             enforce_eager=args.vllm_enforce_eager,
         )
+
+    def close(self):
+        if hasattr(self, "llm"):
+            del self.llm
 
     def generate(self, message_batches):
         formatted_prompts = [
@@ -499,93 +546,100 @@ def parse_args():
     parser.add_argument("--vllm-enforce-eager", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_ENFORCE_EAGER", "false")))
     parser.add_argument("--vllm-merged-model-dir", default=os.environ.get("VLLM_MERGED_MODEL_DIR", ""))
     parser.add_argument("--vllm-force-merge-lora", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_FORCE_MERGE_LORA", "false")))
+    parser.add_argument("--vllm-cleanup-merged-model", type=_str_to_bool, default=_str_to_bool(os.environ.get("VLLM_CLEANUP_MERGED_MODEL", "true")))
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     torch.manual_seed(0)
+    generator = None
 
-    rows = _take_eval_rows(_load_rows(args.eval_file), args)
-    if not rows:
-        raise ValueError(f"No eval rows selected from {args.eval_file}.")
+    try:
+        rows = _take_eval_rows(_load_rows(args.eval_file), args)
+        if not rows:
+            raise ValueError(f"No eval rows selected from {args.eval_file}.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    generator = _make_generator(args, tokenizer)
+        generator = _make_generator(args, tokenizer)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    predictions_path = output_dir / "predictions.jsonl"
-    results = []
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        predictions_path = output_dir / "predictions.jsonl"
+        results = []
 
-    with predictions_path.open("w") as f:
-        for start in range(0, len(rows), args.batch_size):
-            batch = rows[start : start + args.batch_size]
-            message_batches = [_messages_without_answer(row) for row in batch]
-            generated = generator.generate(message_batches)
+        with predictions_path.open("w") as f:
+            for start in range(0, len(rows), args.batch_size):
+                batch = rows[start : start + args.batch_size]
+                message_batches = [_messages_without_answer(row) for row in batch]
+                generated = generator.generate(message_batches)
 
-            for offset, (row, gen) in enumerate(zip(batch, generated)):
-                gold = _gold_action(row)
-                pred, parse_error = _parse_jsonish_action(gen["raw_output"])
-                score = _score_prediction(pred, gold)
-                record = {
-                    "index": args.start_index + start + offset,
-                    "annotation_id": row.get("annotation_id"),
-                    "action_uid": row.get("action_uid"),
-                    "step_idx": row.get("step_idx"),
-                    "mind2web_split": row.get("mind2web_split"),
-                    "website": row.get("website"),
-                    "domain": row.get("domain"),
-                    "subdomain": row.get("subdomain"),
-                    "gold": gold,
-                    "prediction": pred,
-                    "parse_error": parse_error,
-                    "raw_output": gen["raw_output"],
-                    "input": gen["input"],
-                    **score,
-                }
-                results.append(record)
-                f.write(_safe_json_dumps(record, ensure_ascii=False) + "\n")
+                for offset, (row, gen) in enumerate(zip(batch, generated)):
+                    gold = _gold_action(row)
+                    pred, parse_error = _parse_jsonish_action(gen["raw_output"])
+                    score = _score_prediction(pred, gold)
+                    record = {
+                        "index": args.start_index + start + offset,
+                        "annotation_id": row.get("annotation_id"),
+                        "action_uid": row.get("action_uid"),
+                        "step_idx": row.get("step_idx"),
+                        "mind2web_split": row.get("mind2web_split"),
+                        "website": row.get("website"),
+                        "domain": row.get("domain"),
+                        "subdomain": row.get("subdomain"),
+                        "gold": gold,
+                        "prediction": pred,
+                        "parse_error": parse_error,
+                        "raw_output": gen["raw_output"],
+                        "input": gen["input"],
+                        **score,
+                    }
+                    results.append(record)
+                    f.write(_safe_json_dumps(record, ensure_ascii=False) + "\n")
 
-            done = min(start + len(batch), len(rows))
-            answerable = [item for item in results if item["target_id_answerable"]]
-            exact = sum(item["exact_match"] for item in answerable) / len(answerable) if answerable else 0.0
-            target = sum(item["target_id_match"] for item in answerable) / len(answerable) if answerable else 0.0
-            print(f"[{done}/{len(rows)}] exact_action_acc={exact:.4f} target_id_acc={target:.4f}", flush=True)
+                done = min(start + len(batch), len(rows))
+                answerable = [item for item in results if item["target_id_answerable"]]
+                exact = sum(item["exact_match"] for item in answerable) / len(answerable) if answerable else 0.0
+                target = sum(item["target_id_match"] for item in answerable) / len(answerable) if answerable else 0.0
+                print(f"[{done}/{len(rows)}] exact_action_acc={exact:.4f} target_id_acc={target:.4f}", flush=True)
 
-    denominator = len(results)
-    target_id_results = [item for item in results if item["target_id_answerable"]]
-    target_id_denominator = len(target_id_results)
-    summary = {
-        "eval_file": args.eval_file,
-        "split": args.split,
-        "num_examples": denominator,
-        "num_target_id_examples": target_id_denominator,
-        "exact_action_acc": (
-            sum(item["exact_match"] for item in target_id_results) / target_id_denominator
-            if target_id_denominator
-            else 0.0
-        ),
-        "target_id_acc": (
-            sum(item["target_id_match"] for item in target_id_results) / target_id_denominator
-            if target_id_denominator
-            else 0.0
-        ),
-        "overall_exact_action_acc": sum(item["exact_match"] for item in results) / denominator,
-        "op_acc": sum(item["op_match"] for item in results) / denominator,
-        "value_acc": sum(item["value_match"] for item in results) / denominator,
-        "json_parse_error_rate": sum(1 for item in results if item["parse_error"]) / denominator,
-        "backend": args.backend,
-        "model_path": args.model_path,
-        "lora_adapter": args.lora_adapter,
-    }
-    (output_dir / "summary.json").write_text(_safe_json_dumps(summary, indent=2, ensure_ascii=False) + "\n")
-    print(f"Saved predictions to {predictions_path}")
-    print(_safe_json_dumps(summary, indent=2, ensure_ascii=False))
+        denominator = len(results)
+        target_id_results = [item for item in results if item["target_id_answerable"]]
+        target_id_denominator = len(target_id_results)
+        summary = {
+            "eval_file": args.eval_file,
+            "split": args.split,
+            "num_examples": denominator,
+            "num_target_id_examples": target_id_denominator,
+            "exact_action_acc": (
+                sum(item["exact_match"] for item in target_id_results) / target_id_denominator
+                if target_id_denominator
+                else 0.0
+            ),
+            "target_id_acc": (
+                sum(item["target_id_match"] for item in target_id_results) / target_id_denominator
+                if target_id_denominator
+                else 0.0
+            ),
+            "overall_exact_action_acc": sum(item["exact_match"] for item in results) / denominator,
+            "op_acc": sum(item["op_match"] for item in results) / denominator,
+            "value_acc": sum(item["value_match"] for item in results) / denominator,
+            "json_parse_error_rate": sum(1 for item in results if item["parse_error"]) / denominator,
+            "backend": args.backend,
+            "model_path": args.model_path,
+            "lora_adapter": args.lora_adapter,
+        }
+        (output_dir / "summary.json").write_text(_safe_json_dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        print(f"Saved predictions to {predictions_path}")
+        print(_safe_json_dumps(summary, indent=2, ensure_ascii=False))
+    finally:
+        if generator is not None and hasattr(generator, "close"):
+            generator.close()
+        _cleanup_vllm_merged_model(args)
 
 
 if __name__ == "__main__":
