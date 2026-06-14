@@ -203,6 +203,32 @@ def compute_loss(model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tens
     return (token_loss * loss_mask).sum() / (loss_mask.sum() + 1e-8)
 
 
+def get_record_gradient_hook(
+    target_params: list[tuple[str, torch.nn.Parameter]],
+    record_dict: dict[str, torch.Tensor],
+):
+    """Record already materialized grads and immediately free their GPU storage.
+
+    This mirrors the EvolvingCL Gradtransfer hook pattern: every parameter hook
+    scans target parameters whose `.grad` has been populated by autograd,
+    accumulates those tensors on CPU, then sets `.grad = None` before backward
+    proceeds to the next parameters.
+    """
+
+    def record_gradient_hook(grad):
+        for name, param in target_params:
+            if param.requires_grad and param.grad is not None:
+                grad_cpu = param.grad.detach().float().cpu()
+                if name not in record_dict:
+                    record_dict[name] = grad_cpu
+                else:
+                    record_dict[name].add_(grad_cpu)
+                param.grad = None
+        return grad
+
+    return record_gradient_hook
+
+
 def estimate_base_weight_gradients(
     model: nn.Module,
     lora_modules: list[LoraModuleInfo],
@@ -213,9 +239,12 @@ def estimate_base_weight_gradients(
 ) -> dict[str, torch.Tensor]:
     for param in model.parameters():
         param.requires_grad_(False)
-    modules_by_name = {info.name: info.module for info in lora_modules}
-    for module in modules_by_name.values():
+
+    target_params = []
+    for info in lora_modules:
+        module = info.module
         module.base_layer.weight.requires_grad_(True)
+        target_params.append((info.name, module.base_layer.weight))
 
     device = torch.device(args.device)
     model.to(device)
@@ -229,23 +258,33 @@ def estimate_base_weight_gradients(
         collate_fn=lambda data_list: collate_sft_batch(data_list, pad_token_id),
     )
 
-    gradients = {name: torch.zeros_like(module.base_layer.weight, dtype=torch.float32, device="cpu") for name, module in modules_by_name.items()}
+    gradients = {}
+    hooks = []
+    record_gradient_hook = get_record_gradient_hook(target_params, gradients)
+    for _, param in target_params:
+        hooks.append(param.register_hook(record_gradient_hook))
+
     num_batches = 0
-    for batch in tqdm(dataloader, desc=desc):
-        batch = {key: value.to(device) for key, value in batch.items() if isinstance(value, torch.Tensor)}
-        loss = compute_loss(model, batch)
-        loss.backward()
-        num_batches += 1
-        for name, module in modules_by_name.items():
-            grad = module.base_layer.weight.grad
-            if grad is not None:
-                gradients[name].add_((-grad.detach()).float().cpu())
-        model.zero_grad(set_to_none=True)
+    try:
+        for batch in tqdm(dataloader, desc=desc):
+            batch = {key: value.to(device) for key, value in batch.items() if isinstance(value, torch.Tensor)}
+            loss = compute_loss(model, batch)
+            loss.backward()
+            record_gradient_hook(None)
+            num_batches += 1
+            for _, param in target_params:
+                param.grad = None
+            model.zero_grad(set_to_none=True)
+            del loss
+            del batch
+    finally:
+        for hook in hooks:
+            hook.remove()
 
     if num_batches == 0:
         raise ValueError("No calibration batches were produced.")
     for name, grad in gradients.items():
-        grad.div_(num_batches)
+        grad.mul_(-1.0 / num_batches)
         if args.normalize_gradients:
             grad.div_(grad.norm() + 1e-12)
 
