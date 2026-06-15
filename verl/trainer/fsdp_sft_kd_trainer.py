@@ -33,6 +33,7 @@ from verl.utils.device import get_device_name, is_cuda_available, is_npu_availab
 from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_
+from verl.utils.lora_ga import apply_loraga_base_delta, has_loraga_base_delta
 from verl.utils.debug import log_gpu_memory_usage
 
 
@@ -195,6 +196,13 @@ class FSDPSFTKDTrainer(FSDPSFTTrainer):
             if self.device_mesh.get_rank() == 0:
                 print(f"Loading KD teacher LoRA adapter from {teacher_lora_path}")
             teacher_model = PeftModel.from_pretrained(teacher_model, teacher_lora_path, is_trainable=False)
+            if has_loraga_base_delta(teacher_lora_path):
+                loraga_result = apply_loraga_base_delta(teacher_model, teacher_lora_path, strict=False)
+                if self.device_mesh.get_rank() == 0:
+                    print(
+                        "Applied KD teacher LoRA-GA base delta from "
+                        f"{teacher_lora_path}: {len(loraga_result['applied'])} modules"
+                    )
 
         teacher_model.to(self.device_name)
         teacher_model.eval()

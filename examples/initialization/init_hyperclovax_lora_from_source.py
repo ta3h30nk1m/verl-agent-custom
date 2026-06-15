@@ -32,6 +32,7 @@ from verl.trainer.fsdp_sft_trainer import collate_sft_batch
 from verl.utils import hf_tokenizer
 from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.lora_ga import save_loraga_base_delta
 from verl.utils.lora_utils import find_language_layer_prefixes, resolve_lora_target_modules
 from verl.utils.py_functional import convert_to_regular_types
 
@@ -75,6 +76,41 @@ def parse_args() -> argparse.Namespace:
         choices=["simple", "orthogonal", "scale_b", "delta_svd"],
         default="simple",
         help="simple matches the active Gradtransfer simple_mapping branch.",
+    )
+    parser.add_argument(
+        "--init-method",
+        choices=["gradtransfer", "gradtransfer_loraga"],
+        default="gradtransfer",
+        help="gradtransfer_loraga applies a LoRA-GA base offset after Gradtransfer initialization.",
+    )
+    parser.add_argument(
+        "--num-projection-steps",
+        type=int,
+        default=1,
+        help="Repeat Gradtransfer projection N times, updating the target base between attempts like double/tripletransfer.",
+    )
+    parser.add_argument(
+        "--projection-accumulation-scale",
+        type=float,
+        default=1.0,
+        help="Scale used when applying interim projected deltas to the target base and combining repeated projections.",
+    )
+    parser.add_argument(
+        "--source-gradient-mode",
+        choices=["lora_first_then_zero", "always_lora", "always_zero"],
+        default="lora_first_then_zero",
+        help="Source model state used when estimating source gradients across repeated projection steps.",
+    )
+    parser.add_argument(
+        "--loraga-gamma",
+        type=float,
+        default=32.0,
+        help="LoRA-GA gamma used to scale the SVD factors from the post-transfer target gradient.",
+    )
+    parser.add_argument(
+        "--loraga-disable-norm-clip",
+        action="store_true",
+        help="Disable LoRA-GA offset clipping against the current base-plus-transfer weight magnitude.",
     )
     parser.add_argument("--gradient-scale", type=float, default=1.0)
     parser.add_argument("--normalize-gradients", action="store_true")
@@ -353,7 +389,42 @@ def project_lora_weights(
     return target_a, target_b
 
 
-def copy_projected_weights(
+def get_lora_scaling(module: nn.Module) -> float:
+    if hasattr(module, "scaling") and "default" in module.scaling:
+        return float(module.scaling["default"])
+    rank = int(module.r["default"])
+    alpha = float(module.lora_alpha["default"])
+    return alpha / rank
+
+
+def zero_lora_weights(lora_modules: list[LoraModuleInfo]) -> None:
+    with torch.no_grad():
+        for info in lora_modules:
+            info.module.lora_A["default"].weight.zero_()
+            info.module.lora_B["default"].weight.zero_()
+
+
+def snapshot_lora_weights(lora_modules: list[LoraModuleInfo]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    return {
+        info.name: (
+            info.module.lora_A["default"].weight.detach().cpu().clone(),
+            info.module.lora_B["default"].weight.detach().cpu().clone(),
+        )
+        for info in lora_modules
+    }
+
+
+def restore_lora_weights(lora_modules: list[LoraModuleInfo], weights: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
+    with torch.no_grad():
+        for info in lora_modules:
+            source_a, source_b = weights[info.name]
+            a_param = info.module.lora_A["default"].weight
+            b_param = info.module.lora_B["default"].weight
+            a_param.copy_(source_a.to(device=a_param.device, dtype=a_param.dtype))
+            b_param.copy_(source_b.to(device=b_param.device, dtype=b_param.dtype))
+
+
+def project_lora_step(
     target_modules: list[LoraModuleInfo],
     source_modules: list[LoraModuleInfo],
     target_gradients: dict[str, torch.Tensor],
@@ -363,6 +434,7 @@ def copy_projected_weights(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     source_by_key = {(info.layer_idx, info.relative_name): info for info in source_modules}
+    weights = {}
     projected = []
     skipped = []
     layer_mapping = {}
@@ -378,12 +450,12 @@ def copy_projected_weights(
 
             source_a = source_info.module.lora_A["default"].weight.detach().cpu()
             source_b = source_info.module.lora_B["default"].weight.detach().cpu()
-            target_a_param = target_info.module.lora_A["default"].weight
-            target_b_param = target_info.module.lora_B["default"].weight
-            if tuple(target_a_param.shape) != (source_a.shape[0], target_a_param.shape[1]):
+            target_a_shape = tuple(target_info.module.lora_A["default"].weight.shape)
+            target_b_shape = tuple(target_info.module.lora_B["default"].weight.shape)
+            if target_a_shape != (source_a.shape[0], target_a_shape[1]):
                 skipped.append({"target": target_info.name, "source": source_info.name, "reason": "LoRA rank mismatch"})
                 continue
-            if tuple(target_b_param.shape) != (target_b_param.shape[0], source_b.shape[1]):
+            if target_b_shape != (target_b_shape[0], source_b.shape[1]):
                 skipped.append({"target": target_info.name, "source": source_info.name, "reason": "LoRA rank mismatch"})
                 continue
 
@@ -394,7 +466,7 @@ def copy_projected_weights(
                 target_gradients[target_info.name],
                 args,
             )
-            if tuple(target_a.shape) != tuple(target_a_param.shape) or tuple(target_b.shape) != tuple(target_b_param.shape):
+            if tuple(target_a.shape) != target_a_shape or tuple(target_b.shape) != target_b_shape:
                 skipped.append(
                     {
                         "target": target_info.name,
@@ -403,13 +475,240 @@ def copy_projected_weights(
                     }
                 )
                 continue
-            target_a_param.copy_(target_a.to(dtype=target_a_param.dtype))
-            target_b_param.copy_(target_b.to(dtype=target_b_param.dtype))
+            weights[target_info.name] = {"a": target_a, "b": target_b, "source": source_info.name}
             projected.append({"target": target_info.name, "source": source_info.name})
 
     if not projected:
         raise ValueError(f"No LoRA modules were projected. First skipped items: {skipped[:5]}")
-    return {"projected": projected, "skipped": skipped, "layer_mapping": layer_mapping}
+    return {"weights": weights, "projected": projected, "skipped": skipped, "layer_mapping": layer_mapping}
+
+
+def copy_lora_weights_to_target(
+    target_modules: list[LoraModuleInfo],
+    weights: dict[str, dict[str, Any]],
+) -> None:
+    target_by_name = {info.name: info for info in target_modules}
+    with torch.no_grad():
+        for name, item in weights.items():
+            module = target_by_name[name].module
+            a_param = module.lora_A["default"].weight
+            b_param = module.lora_B["default"].weight
+            a_param.copy_(item["a"].to(device=a_param.device, dtype=a_param.dtype))
+            b_param.copy_(item["b"].to(device=b_param.device, dtype=b_param.dtype))
+
+
+def apply_projected_delta_to_base(
+    target_modules: list[LoraModuleInfo],
+    weights: dict[str, dict[str, Any]],
+    scale: float,
+) -> None:
+    target_by_name = {info.name: info for info in target_modules}
+    with torch.no_grad():
+        for name, item in weights.items():
+            module = target_by_name[name].module
+            delta = item["b"].float() @ item["a"].float()
+            delta.mul_(get_lora_scaling(module) * scale)
+            delta = delta.to(device=module.base_layer.weight.device, dtype=module.base_layer.weight.dtype)
+            module.base_layer.weight.add_(delta)
+
+
+def restore_projected_base_updates(
+    target_modules: list[LoraModuleInfo],
+    step_weights: list[dict[str, dict[str, Any]]],
+    scale: float,
+) -> None:
+    for weights in reversed(step_weights):
+        apply_projected_delta_to_base(target_modules, weights, -scale)
+
+
+def combine_projection_steps(step_weights: list[dict[str, dict[str, Any]]], accumulation_scale: float) -> dict[str, dict[str, Any]]:
+    if not step_weights:
+        raise ValueError("No projection steps were computed.")
+    names = set(step_weights[0])
+    for weights in step_weights[1:]:
+        names.intersection_update(weights)
+    if not names:
+        raise ValueError("No LoRA modules were projected in every projection step.")
+
+    combine_scale = math.sqrt(accumulation_scale) if len(step_weights) > 1 else 1.0
+    combined = {}
+    for name in sorted(names):
+        a = sum(weights[name]["a"].float() for weights in step_weights) * combine_scale
+        b = sum(weights[name]["b"].float() for weights in step_weights) * combine_scale
+        combined[name] = {"a": a.cpu(), "b": b.cpu(), "source": step_weights[0][name]["source"]}
+    return combined
+
+
+def initialize_with_gradtransfer(
+    target_model: nn.Module,
+    target_modules: list[LoraModuleInfo],
+    source_model: nn.Module,
+    source_modules: list[LoraModuleInfo],
+    calibration_dataset: Subset,
+    tokenizer,
+    target_layer_count: int,
+    source_layer_count: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if args.num_projection_steps < 1:
+        raise ValueError("--num-projection-steps must be >= 1.")
+    if args.projection_accumulation_scale <= 0:
+        raise ValueError("--projection-accumulation-scale must be > 0.")
+
+    source_lora_snapshot = snapshot_lora_weights(source_modules)
+    all_step_weights = []
+    base_update_steps: list[dict[str, dict[str, Any]]] = []
+    projected_steps = []
+    skipped_steps = []
+    layer_mapping = {}
+
+    try:
+        for step_idx in range(args.num_projection_steps):
+            print(f"Projection step {step_idx + 1}/{args.num_projection_steps}", flush=True)
+            if args.source_gradient_mode == "always_zero" or (
+                args.source_gradient_mode == "lora_first_then_zero" and step_idx > 0
+            ):
+                zero_lora_weights(source_modules)
+            else:
+                restore_lora_weights(source_modules, source_lora_snapshot)
+
+            target_gradients = estimate_base_weight_gradients(
+                target_model,
+                target_modules,
+                calibration_dataset,
+                tokenizer,
+                args,
+                desc=f"Target gradients step {step_idx + 1}",
+            )
+            source_gradients = estimate_base_weight_gradients(
+                source_model,
+                source_modules,
+                calibration_dataset,
+                tokenizer,
+                args,
+                desc=f"Source gradients step {step_idx + 1}",
+            )
+            restore_lora_weights(source_modules, source_lora_snapshot)
+            step_summary = project_lora_step(
+                target_modules,
+                source_modules,
+                target_gradients,
+                source_gradients,
+                target_layer_count,
+                source_layer_count,
+                args,
+            )
+            all_step_weights.append(step_summary["weights"])
+            projected_steps.append(step_summary["projected"])
+            skipped_steps.append(step_summary["skipped"])
+            layer_mapping.update(step_summary["layer_mapping"])
+
+            del target_gradients
+            del source_gradients
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            if step_idx + 1 < args.num_projection_steps:
+                apply_projected_delta_to_base(
+                    target_modules,
+                    step_summary["weights"],
+                    args.projection_accumulation_scale,
+                )
+                base_update_steps.append(step_summary["weights"])
+    finally:
+        restore_projected_base_updates(target_modules, base_update_steps, args.projection_accumulation_scale)
+        restore_lora_weights(source_modules, source_lora_snapshot)
+
+    combined_weights = combine_projection_steps(all_step_weights, args.projection_accumulation_scale)
+    copy_lora_weights_to_target(target_modules, combined_weights)
+    projected = [{"target": name, "source": item["source"]} for name, item in combined_weights.items()]
+    return {
+        "projected": projected,
+        "skipped": [item for skipped in skipped_steps for item in skipped],
+        "projected_steps": projected_steps,
+        "layer_mapping": layer_mapping,
+    }
+
+
+def apply_loraga_initialization(
+    target_model: nn.Module,
+    target_modules: list[LoraModuleInfo],
+    calibration_dataset: Subset,
+    tokenizer,
+    args: argparse.Namespace,
+) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], dict[str, Any]]:
+    if args.loraga_gamma <= 0:
+        raise ValueError("--loraga-gamma must be > 0.")
+
+    gradients = estimate_base_weight_gradients(
+        target_model,
+        target_modules,
+        calibration_dataset,
+        tokenizer,
+        args,
+        desc="LoRA-GA target gradients",
+    )
+    projection_device = torch.device(args.device if args.device != "cpu" and torch.cuda.is_available() else "cpu")
+    delta_factors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    applied = []
+
+    with torch.no_grad():
+        for info in target_modules:
+            module = info.module
+            grad = gradients[info.name].float().to(projection_device)
+            u, _, vh = torch.linalg.svd(-grad, full_matrices=False)
+            rank = module.lora_A["default"].weight.shape[0]
+            if u.shape[1] >= 2 * rank:
+                b = u[:, rank : 2 * rank]
+            else:
+                b = u[:, :rank]
+            if vh.shape[0] < rank:
+                raise ValueError(f"LoRA-GA rank {rank} exceeds gradient rank for {info.name}.")
+            a = vh[:rank, :]
+
+            out_dim = grad.shape[0]
+            factor = (out_dim**0.25) / math.sqrt(args.loraga_gamma)
+            a = a * factor
+            b = b * factor
+
+            prev_a = module.lora_A["default"].weight.detach().float().to(projection_device)
+            prev_b = module.lora_B["default"].weight.detach().float().to(projection_device)
+            scaling = get_lora_scaling(module)
+            offset = (b @ a) * scaling
+            prev_delta = (prev_b @ prev_a) * scaling
+
+            clip_ratio = None
+            if not args.loraga_disable_norm_clip:
+                denominator = torch.max(torch.abs(offset))
+                if denominator > 0:
+                    numerator = torch.max(torch.abs(module.base_layer.weight.detach().to(projection_device).float() + prev_delta))
+                    ratio = numerator / denominator
+                    if ratio < 1:
+                        clip_ratio = float(ratio.item())
+                        scale = torch.sqrt(ratio)
+                        a = a * scale
+                        b = b * scale
+
+            delta_a = torch.cat([a, prev_a], dim=0)
+            delta_b = torch.cat([b, -prev_b], dim=1)
+            base_delta = (delta_b @ delta_a) * scaling
+            module.base_layer.weight.sub_(base_delta.to(device=module.base_layer.weight.device, dtype=module.base_layer.weight.dtype))
+            module.lora_A["default"].weight.copy_(a.to(device=module.lora_A["default"].weight.device, dtype=module.lora_A["default"].weight.dtype))
+            module.lora_B["default"].weight.copy_(b.to(device=module.lora_B["default"].weight.device, dtype=module.lora_B["default"].weight.dtype))
+            delta_factors[info.name] = (delta_a.cpu(), delta_b.cpu())
+            applied.append(
+                {
+                    "target": info.name,
+                    "delta_rank": int(delta_a.shape[0]),
+                    "clip_ratio": clip_ratio,
+                }
+            )
+
+    del gradients
+    if projection_device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+    return delta_factors, {"loraga_applied": applied, "loraga_gamma": args.loraga_gamma}
 
 
 def main() -> None:
@@ -450,14 +749,6 @@ def main() -> None:
     target_lora_modules = collect_lora_modules(target_model, peft_layer_prefix(target_layer_prefix))
     if not target_lora_modules:
         raise ValueError("No target LoRA modules were found.")
-    target_gradients = estimate_base_weight_gradients(
-        target_model,
-        target_lora_modules,
-        calibration_dataset,
-        tokenizer,
-        args,
-        desc="Target gradients",
-    )
 
     print(f"Loading source model: {args.source_model_path}", flush=True)
     source_base = load_base_model(args.source_model_path, args)
@@ -472,13 +763,17 @@ def main() -> None:
             f"Source adapter rank ({source_rank}) differs from target rank ({target_rank}). "
             "Use the same rank or regenerate the target adapter config."
         )
-    source_gradients = estimate_base_weight_gradients(
+
+    summary = initialize_with_gradtransfer(
+        target_model,
+        target_lora_modules,
         source_model,
         source_lora_modules,
         calibration_dataset,
         tokenizer,
+        target_layer_count,
+        source_layer_count,
         args,
-        desc="Source gradients",
     )
     source_model.to("cpu")
     del source_model
@@ -486,15 +781,17 @@ def main() -> None:
     torch.cuda.empty_cache()
     gc.collect()
 
-    summary = copy_projected_weights(
-        target_lora_modules,
-        source_lora_modules,
-        target_gradients,
-        source_gradients,
-        target_layer_count,
-        source_layer_count,
-        args,
-    )
+    loraga_delta_factors = None
+    if args.init_method == "gradtransfer_loraga":
+        loraga_delta_factors, loraga_summary = apply_loraga_initialization(
+            target_model,
+            target_lora_modules,
+            calibration_dataset,
+            tokenizer,
+            args,
+        )
+        summary.update(loraga_summary)
+
     summary.update(
         {
             "source_model_path": args.source_model_path,
@@ -502,8 +799,12 @@ def main() -> None:
             "target_model_path": args.target_model_path,
             "train_files": split_paths(args.train_files),
             "num_calibration_samples": len(calibration_dataset),
+            "init_method": args.init_method,
+            "num_projection_steps": args.num_projection_steps,
             "projection_method": args.projection_method,
             "projection_rank": args.projection_rank or target_rank,
+            "projection_accumulation_scale": args.projection_accumulation_scale,
+            "source_gradient_mode": args.source_gradient_mode,
             "gradient_scale": args.gradient_scale,
             "target_layer_prefix": target_layer_prefix,
             "source_layer_prefix": source_layer_prefix,
@@ -514,6 +815,20 @@ def main() -> None:
 
     target_model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
+    if loraga_delta_factors is not None:
+        save_loraga_base_delta(
+            output_dir,
+            loraga_delta_factors,
+            metadata={
+                "init_method": args.init_method,
+                "loraga_gamma": args.loraga_gamma,
+                "num_projection_steps": args.num_projection_steps,
+                "projection_accumulation_scale": args.projection_accumulation_scale,
+                "source_model_path": args.source_model_path,
+                "source_lora_path": args.source_lora_path,
+                "target_model_path": args.target_model_path,
+            },
+        )
     with open(output_dir / "lora_transfer_init_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

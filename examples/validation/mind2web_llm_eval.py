@@ -12,6 +12,8 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
+from verl.utils.lora_ga import apply_loraga_base_delta
+
 
 def _str_to_bool(value):
     if isinstance(value, bool):
@@ -230,6 +232,7 @@ def _merge_lora_for_vllm(args, tokenizer):
         trust_remote_code=args.trust_remote_code,
     )
     peft_model = PeftModel.from_pretrained(base_model, args.lora_adapter)
+    apply_loraga_base_delta(peft_model, args.lora_adapter, strict=False)
     merged_model = peft_model.merge_and_unload()
 
     tmp_dir = merged_dir.with_name(f".{merged_dir.name}.tmp")
@@ -287,6 +290,7 @@ class HFGenerator:
             from peft import PeftModel
 
             self.model = PeftModel.from_pretrained(self.model, args.lora_adapter)
+            apply_loraga_base_delta(self.model, args.lora_adapter, strict=False)
         self.model = self.model.to(args.device)
         self.model.eval()
         self.tokenizer = tokenizer

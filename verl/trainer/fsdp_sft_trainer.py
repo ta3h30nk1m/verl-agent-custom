@@ -60,6 +60,7 @@ from verl.utils.fsdp_utils import (
     init_fn,
     fsdp2_clip_grad_norm_
 )
+from verl.utils.lora_ga import apply_loraga_base_delta, copy_loraga_base_delta_files, has_loraga_base_delta
 from verl.utils.lora_utils import resolve_lora_target_modules
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 from verl.utils.py_functional import convert_to_regular_types
@@ -139,6 +140,7 @@ class FSDPSFTTrainer:
         self.ulysses_device_mesh = ulysses_device_mesh
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.tokenizer = tokenizer
+        self.loraga_base_delta_source_path = None
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
@@ -269,6 +271,14 @@ class FSDPSFTTrainer:
                     if self.device_mesh.get_rank() == 0:
                         print(f"Loading LoRA adapter initialization from {lora_adapter_path}")
                     self.model = PeftModel.from_pretrained(self.model, lora_adapter_path, is_trainable=True)
+                    if has_loraga_base_delta(lora_adapter_path):
+                        loraga_result = apply_loraga_base_delta(self.model, lora_adapter_path, strict=False)
+                        self.loraga_base_delta_source_path = lora_adapter_path
+                        if self.device_mesh.get_rank() == 0:
+                            print(
+                                "Applied LoRA-GA base delta from "
+                                f"{lora_adapter_path}: {len(loraga_result['applied'])} modules"
+                            )
                 else:
                     target_modules = resolve_lora_target_modules(
                         self.model,
@@ -654,6 +664,7 @@ class FSDPSFTTrainer:
                 os.makedirs(path, exist_ok=True)
                 self.model.save_pretrained(path, state_dict=state_dict)
                 self.tokenizer.save_pretrained(path)
+                copy_loraga_base_delta_files(self.loraga_base_delta_source_path, path)
         elif fsdp_strategy == "fsdp2":
             # FSDP2 checkpoint saving
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
@@ -668,6 +679,7 @@ class FSDPSFTTrainer:
                 self.model.save_pretrained(path, state_dict=state_dict)
                 self.model_config.save_pretrained(path)
                 self.tokenizer.save_pretrained(path)
+                copy_loraga_base_delta_files(self.loraga_base_delta_source_path, path)
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
