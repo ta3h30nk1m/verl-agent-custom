@@ -8,6 +8,10 @@ usage() {
     echo "  run_hyperclovax_lora_single_gpu.sh <nproc_per_node> <task_type> <save_path> [other_configs...]"
 }
 
+_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+. "${_SCRIPT_DIR}/../../../scripts/load_experiment_env.sh"
+unset _SCRIPT_DIR
+
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 VALID_TASKS=(
@@ -142,6 +146,8 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-1}
 SP_SIZE=${SP_SIZE:-1}
 LR=${LR:-2e-4}
+LR_SCHEDULER=${LR_SCHEDULER:-constant}
+WARMUP_STEPS_RATIO=${WARMUP_STEPS_RATIO:-0.0}
 
 LORA_RANK=${LORA_RANK:-64}
 LORA_ALPHA=${LORA_ALPHA:-128}
@@ -181,6 +187,8 @@ echo "REQUESTED_TOTAL_EPOCHS=${REQUESTED_TOTAL_EPOCHS}"
 echo "MAX_STEPS=${MAX_STEPS:-<unset>}"
 echo "MAX_STEPS_STRICT=${MAX_STEPS_STRICT}"
 echo "LORA_ADAPTER_PATH=${LORA_ADAPTER_PATH}"
+echo "LR_SCHEDULER=${LR_SCHEDULER}"
+echo "WARMUP_STEPS_RATIO=${WARMUP_STEPS_RATIO}"
 
 torchrun --standalone --nnodes=1 --nproc_per_node="${nproc_per_node}" \
     -m verl.trainer.fsdp_sft_trainer \
@@ -202,7 +210,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node="${nproc_per_node}" \
     model.lora_adapter_path="${LORA_ADAPTER_PATH}" \
     model.trust_remote_code=true \
     optim.lr="${LR}" \
-    optim.warmup_steps_ratio=0.03 \
+    optim.lr_scheduler="${LR_SCHEDULER}" \
+    optim.warmup_steps_ratio="${WARMUP_STEPS_RATIO}" \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name=mave-sft \
     trainer.experiment_name="${EXPERIMENT_NAME}" \

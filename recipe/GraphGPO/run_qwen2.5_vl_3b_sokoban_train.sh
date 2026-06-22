@@ -1,4 +1,7 @@
 set -x
+_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+. "${_SCRIPT_DIR}/../../scripts/load_experiment_env.sh"
+unset _SCRIPT_DIR
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export HF_HOME=${HF_HOME}

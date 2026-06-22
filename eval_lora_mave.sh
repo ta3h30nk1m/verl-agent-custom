@@ -7,11 +7,14 @@ set -xeuo pipefail
 #   LORA_ADAPTER=outputs/mave_hyperclovax_multi_attribute_card_completion_lora_steps5000_lr2e-4_r64/global_step_5000 \
 #   bash eval_lora_mave.sh
 
+. "$(dirname -- "${BASH_SOURCE[0]}")/scripts/load_experiment_env.sh"
+
 export HF_MODULES_CACHE=${HF_MODULES_CACHE:-"${PWD}/.cache/huggingface/modules"}
 mkdir -p "${HF_MODULES_CACHE}"
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-${1:-0}}
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
+export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_FLASH_ATTN_VERSION=${VLLM_FLASH_ATTN_VERSION:-2}
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
 

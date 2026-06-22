@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-gradient-mode",
         choices=["lora_first_then_zero", "always_lora", "always_zero"],
-        default="lora_first_then_zero",
+        default="always_zero",
         help="Source model state used when estimating source gradients across repeated projection steps.",
     )
     parser.add_argument(

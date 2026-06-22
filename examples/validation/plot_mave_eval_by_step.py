@@ -53,6 +53,19 @@ def infer_task(summary_path: Path, summary: dict[str, Any]) -> str:
     return ""
 
 
+def infer_run_id(summary_path: Path, summary: dict[str, Any]) -> str:
+    adapter = str(summary.get("lora_adapter", "") or "")
+    if adapter:
+        adapter_path = Path(adapter)
+        if adapter_path.name.startswith("global_step_"):
+            return adapter_path.parent.name
+        return adapter_path.name
+
+    run_name = summary_path.parent.name
+    run_name = re.sub(r"_global_step_\d+.*$", "", run_name)
+    return run_name
+
+
 def flatten_numeric(prefix: str, value: Any) -> dict[str, float]:
     if isinstance(value, dict):
         result = {}
@@ -80,6 +93,7 @@ def collect_rows(root: Path) -> list[dict[str, Any]]:
         task = infer_task(summary_path, summary)
         row: dict[str, Any] = {
             "task": task,
+            "run_id": infer_run_id(summary_path, summary),
             "global_step": step,
             "run_name": summary_path.parent.name,
             "summary_path": str(summary_path),
@@ -109,6 +123,7 @@ def write_csv(rows: list[dict[str, Any]], output: Path) -> None:
 
     preferred = [
         "task",
+        "run_id",
         "global_step",
         "primary_acc",
         "exact_match",
@@ -141,7 +156,21 @@ def select_metrics(rows: list[dict[str, Any]], requested: list[str] | None) -> l
     return [metric for metric in DEFAULT_METRICS if metric in available]
 
 
-def plot_metric(rows: list[dict[str, Any]], metric: str, output_dir: Path, *, title_prefix: str) -> Path | None:
+def resolve_group_by(rows: list[dict[str, Any]], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    tasks = {row.get("task") for row in rows if row.get("task")}
+    return "run_id" if len(tasks) == 1 else "task"
+
+
+def plot_metric(
+    rows: list[dict[str, Any]],
+    metric: str,
+    output_dir: Path,
+    *,
+    title_prefix: str,
+    group_by: str,
+) -> Path | None:
     try:
         os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
         import matplotlib.pyplot as plt
@@ -151,27 +180,28 @@ def plot_metric(rows: list[dict[str, Any]], metric: str, output_dir: Path, *, ti
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if metric in row and row.get("task"):
-            grouped[str(row["task"])].append(row)
+        label = row.get(group_by)
+        if metric in row and label:
+            grouped[str(label)].append(row)
     if not grouped:
         print(f"Skipping metric={metric}: no rows with that metric.")
         return None
 
     plt.figure(figsize=(10, 6))
-    for task, task_rows in sorted(grouped.items()):
+    for label, task_rows in sorted(grouped.items()):
         task_rows = sorted(task_rows, key=lambda row: int(row["global_step"]))
         steps = [int(row["global_step"]) for row in task_rows]
         values = [float(row[metric]) for row in task_rows]
-        plt.plot(steps, values, marker="o", linewidth=1.8, markersize=3.5, label=task)
+        plt.plot(steps, values, marker="o", linewidth=1.8, markersize=3.5, label=label)
 
     plt.xlabel("Global Step")
     plt.ylabel(metric)
-    plt.title(f"{title_prefix}{metric} by Global Step")
+    plt.title(f"{title_prefix}{metric} by Global Step ({group_by})")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{metric.replace('.', '_')}_by_step.png"
+    path = output_dir / f"{metric.replace('.', '_')}_by_step_by_{group_by}.png"
     plt.savefig(path, dpi=180)
     plt.close()
     print(f"Wrote plot to {path}")
@@ -186,6 +216,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", action="append", choices=list(TASKS), default=None)
     parser.add_argument("--metric", action="append", default=None, help="Metric to plot. Can be repeated.")
     parser.add_argument("--keyword", action="append", default=None, help="Keep rows whose summary path contains this keyword. Can be repeated.")
+    parser.add_argument("--group-by", choices=["auto", "task", "run_id"], default="auto")
     parser.add_argument("--title-prefix", default="MAVE ")
     return parser.parse_args()
 
@@ -209,8 +240,9 @@ def main() -> None:
     write_csv(rows, output_csv)
 
     metrics = select_metrics(rows, args.metric)
+    group_by = resolve_group_by(rows, args.group_by)
     for metric in metrics:
-        plot_metric(rows, metric, args.output_dir, title_prefix=args.title_prefix)
+        plot_metric(rows, metric, args.output_dir, title_prefix=args.title_prefix, group_by=group_by)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+. "$(dirname -- "${BASH_SOURCE[0]}")/scripts/load_experiment_env.sh"
 export HF_MODULES_CACHE=${PWD}/.cache/huggingface/modules
 
 mkdir -p "${HF_MODULES_CACHE}"

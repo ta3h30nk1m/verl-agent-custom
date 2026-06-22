@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 

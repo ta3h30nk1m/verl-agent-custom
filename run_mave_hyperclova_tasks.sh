@@ -2,7 +2,9 @@
 set -xeuo pipefail
 
 # Run one MAVE LoRA SFT job per task, sequentially.
-# Set HF_TOKEN / WANDB_API_KEY in your shell if private model or wandb logging is needed.
+# Token env vars are loaded from .experiment_env when present.
+
+. "$(dirname -- "${BASH_SOURCE[0]}")/scripts/load_experiment_env.sh"
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 

@@ -31,7 +31,7 @@ from verl.utils.device import get_device_name, is_cuda_available, is_npu_availab
 from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_
-from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
+from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 
 
 logger = logging.getLogger(__file__)
@@ -167,20 +167,26 @@ class FSDPSFTBetaKDTrainer(FSDPSFTKDTrainer):
 
     def _rebuild_lr_scheduler(self):
         num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
-        if not hasattr(self.config.optim, "lr_scheduler") or self.config.optim.lr_scheduler == "cosine":
+        lr_scheduler = self.config.optim.get("lr_scheduler", "cosine")
+        if lr_scheduler == "cosine":
             self.lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=self.optimizer,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=self.total_steps,
             )
-        elif self.config.optim.lr_scheduler == "wsd":
+        elif lr_scheduler == "constant":
+            self.lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=self.optimizer,
+                num_warmup_steps=num_warmup_steps,
+            )
+        elif lr_scheduler == "wsd":
             self.lr_scheduler = get_wsd_schedule_with_warmup(
                 optimizer=self.optimizer,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=self.total_steps,
             )
         else:
-            raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
+            raise ValueError(f"Unknown lr scheduler: {lr_scheduler}")
 
     def _parse_loss_names(self, spec):
         if spec is None:

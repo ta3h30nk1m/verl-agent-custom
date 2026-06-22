@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+. "${_SCRIPT_DIR}/../../../scripts/load_experiment_env.sh"
+unset _SCRIPT_DIR
+
 if [ "$#" -lt 2 ]; then
     echo "Usage: run_hyperclovax_3b_sp2.sh <nproc_per_node> <save_path> [other_configs...]"
     exit 1
@@ -19,8 +23,6 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-8}
 SP_SIZE=${SP_SIZE:-2}
 LR=${LR:-2e-4}
-
-export WANDB_API_KEY=v1_VNxn5dtAZcV3WnBUyWw9pu2ux25_DvuJ7PJ4BviVwtIkxYQ8WHf3HIU3wRaF52nskJqE9Oj233fhJ
 
 torchrun --standalone --nnodes=1 --nproc_per_node="${nproc_per_node}" \
     -m verl.trainer.fsdp_sft_trainer \

@@ -62,7 +62,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.lora_ga import apply_loraga_base_delta, copy_loraga_base_delta_files, has_loraga_base_delta
 from verl.utils.lora_utils import resolve_lora_target_modules
-from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
+from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.tracking import Tracking
 from verl.utils.ulysses import (
@@ -383,12 +383,15 @@ class FSDPSFTTrainer:
 
         num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
 
-        if not hasattr(self.config.optim, "lr_scheduler") or self.config.optim.lr_scheduler == "cosine":
+        lr_scheduler = self.config.optim.get("lr_scheduler", "cosine")
+        if lr_scheduler == "cosine":
             self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps)
-        elif self.config.optim.lr_scheduler == "wsd":
+        elif lr_scheduler == "constant":
+            self.lr_scheduler = get_constant_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps)
+        elif lr_scheduler == "wsd":
             self.lr_scheduler = get_wsd_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps)
         else:
-            raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
+            raise ValueError(f"Unknown lr scheduler: {lr_scheduler}")
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""

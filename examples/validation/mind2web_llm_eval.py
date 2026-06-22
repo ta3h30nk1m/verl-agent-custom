@@ -9,6 +9,8 @@ import re
 import shutil
 from pathlib import Path
 
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 

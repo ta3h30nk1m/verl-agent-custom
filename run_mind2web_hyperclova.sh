@@ -2,7 +2,9 @@
 set -xeuo pipefail
 
 # Run Mind2Web LoRA SFT for the three HyperCLOVAX models on one GPU,
-# sequentially. Set HF_TOKEN / WANDB_API_KEY in your shell if needed.
+# sequentially. Token env vars are loaded from .experiment_env when present.
+
+. "$(dirname -- "${BASH_SOURCE[0]}")/scripts/load_experiment_env.sh"
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
@@ -33,7 +35,7 @@ COMMON_ENV=(
     MAX_LENGTH="${MAX_LENGTH:-8192}"
     LR="${LR:-2e-4}"
     LORA_RANK="${LORA_RANK:-64}"
-    LORA_ALPHA="${LORA_ALPHA:-128}"
+    LORA_ALPHA="${LORA_ALPHA:-64}"
     LORA_TARGET_SCOPE="${LORA_TARGET_SCOPE:-llm}"
     LOSS_VAL_ENABLE="${LOSS_VAL_ENABLE:-true}"
     LOSS_VAL_FREQ="${LOSS_VAL_FREQ:-200}"
@@ -41,20 +43,24 @@ COMMON_ENV=(
     LOGGER="${LOGGER:-['console','wandb']}"
 )
 
-env "${COMMON_ENV[@]}" \
-    MODEL_PATH=naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-1.5B \
-    SAVE_PATH=outputs/mind2web_hyperclovax_1_5B_lora \
-    EXPERIMENT_NAME=mind2web-hyperclovax-1.5b-lora \
-    bash examples/sft/mind2web/run_hyperclovax_lora_single_gpu.sh
+# env "${COMMON_ENV[@]}" \
+#     MODEL_PATH=naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-1.5B \
+#     SAVE_PATH=outputs/mind2web_hyperclovax_1_5B_lora \
+#     EXPERIMENT_NAME=mind2web-hyperclovax-1.5b-lora \
+#     bash examples/sft/mind2web/run_hyperclovax_lora_single_gpu.sh
+
+# env "${COMMON_ENV[@]}" \
+#     MODEL_PATH=naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-0.5B \
+#     SAVE_PATH=outputs/mind2web_hyperclovax_0_5B_lora \
+#     EXPERIMENT_NAME=mind2web-hyperclovax-0.5b-lora \
+#     bash examples/sft/mind2web/run_hyperclovax_lora_single_gpu.sh
+
+
+    # LORA_ADAPTER_PATH=outputs/init_lora_0_5b_to_3b_norm_scale1 \
 
 env "${COMMON_ENV[@]}" \
-    MODEL_PATH=naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-0.5B \
-    SAVE_PATH=outputs/mind2web_hyperclovax_0_5B_lora \
-    EXPERIMENT_NAME=mind2web-hyperclovax-0.5b-lora \
-    bash examples/sft/mind2web/run_hyperclovax_lora_single_gpu.sh
-
-env "${COMMON_ENV[@]}" \
+    LORA_ADAPTER_PATH=outputs/init_lora_0_5b_to_3b_double_normalize_simple_scale1 \
     MODEL_PATH=naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B \
-    SAVE_PATH=outputs/mind2web_hyperclovax_3B_lora \
-    EXPERIMENT_NAME=mind2web-hyperclovax-3b-vision-lora \
+    SAVE_PATH=outputs/mind2web_hyperclovax_3B_lora_graddoubletransfer_normalize_scale1 \
+    EXPERIMENT_NAME=mind2web-hyperclovax-3b-vision-lr2e-4 \
     bash examples/sft/mind2web/run_hyperclovax_lora_single_gpu.sh

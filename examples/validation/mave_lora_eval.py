@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 TASKS = (
     "single_attribute_qa",

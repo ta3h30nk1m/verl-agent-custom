@@ -1,0 +1,4 @@
+# Optional local experiment secrets.
+# Fill these in .experiment_env at the repository root.
+HF_TOKEN=
+WANDB_API_KEY=

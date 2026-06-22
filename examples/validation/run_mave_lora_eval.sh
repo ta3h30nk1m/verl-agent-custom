@@ -11,6 +11,7 @@ MAVE_EVAL_FILE=${MAVE_EVAL_FILE:-"${DATA_DIR}/by_task/${MAVE_TASK}/${EVAL_SPLIT}
 MODEL_PATH=${MODEL_PATH:-naver-hyperclovax/HyperCLOVAX-SEED-Text-Instruct-1.5B}
 OUTPUT_DIR=${OUTPUT_DIR:-"checkpoints/verl_agent_mave/${MAVE_TASK}_eval"}
 BACKEND=${BACKEND:-vllm}
+export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 
 python3 -m examples.validation.mave_lora_eval \
     --backend "${BACKEND}" \
